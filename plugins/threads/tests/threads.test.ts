@@ -2901,6 +2901,21 @@ describe("threads: pane polish", () => {
     }
   });
 
+  test("the title column leaves room for the hotkey: a badge on the desktop, '1: ' on the terminal", async ($, on) => {
+    const { scout } = await paneWorld($, on, { scout: "idle" });
+    for (const [surface, keyW] of [["desktop", 7], ["terminal", 3]] as const) {
+      for (const cols of [140, 80, 60]) {
+        const ui = await mountPane($, surface, cols);
+        const row = nodeOf(await ui.drawn(), `row:${scout.id}`);
+        const title = nodeOf(row, `sel:${scout.id}`);
+        expect(title.props.label).toBe("Haiku scout"); // whole, not "Haiku s…"
+        const column = (row.children as any[])[2]; // marker, dot, then the title's column
+        expect(column.props.width).toBeGreaterThanOrEqual("Haiku scout".length + keyW);
+        await ui.unmount();
+      }
+    }
+  });
+
   // wide: the tree left and the detail right; narrow: stacked. No blank row under the head or between the status line and the
   // actions; the stacked layout keeps one between the tree and the detail, and the feed is one blank row below the details.
   const STATES: Array<[string, Parameters<typeof paneWorld>[2]]> = [

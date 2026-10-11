@@ -594,7 +594,9 @@ export function register(on, options) {
     // marker (3), dot (1), three gaps, then the model, "new" and cost columns
     const rowFixed = 3 + 1 + 3 + chipW + (hasNew ? 4 : 0) + (costW ? 1 + costW : 0);
     // what is left of the column after the fixed cells, never more: a floor above that overflows the column by the difference
-    const titleW = Math.max(4, Math.min(leftW - rowFixed, Math.max(0, ...shown.map((t) => titleOf(t).length + 3))));
+    // the hotkey takes "1: " on the terminal; on the desktop a badge plus button padding takes about twice that
+    const keyW = isDesktop ? 7 : 3;
+    const titleW = Math.max(4, Math.min(leftW - rowFixed, Math.max(0, ...shown.map((t) => titleOf(t).length + keyW))));
     const row = (t, i, indent) => {
       const hotkey = i < 9 ? String(i + 1) : undefined;
       const isSel = selected && t.id === selected.id;
@@ -611,7 +613,7 @@ export function register(on, options) {
             children: [
               Button({
                 key: `sel:${t.id}`,
-                label: clip(titleOf(t), titleW - 3),
+                label: clip(titleOf(t), titleW - keyW),
                 hotkey,
                 plain: true,
                 dimColor: !isSel,
