@@ -1357,18 +1357,22 @@ export function paneTime(ms) {
   return `${two(d.getHours())}:${two(d.getMinutes())}`;
 }
 
-const HOME_PREFIX = /^(?:\/Users\/[^/]+|\/home\/[^/]+)(?=\/|$)/;
 // A path-looking word: it starts the text or follows a space or an opening mark, and begins with / or ~/ (so a URL's // never matches).
 const PATH_WORD = /(^|[\s"'`(=,[])(~?\/[^\s"'`)\],;|]+)/g;
 
-export function homePath(path) {
-  return String(path ?? "").replace(HOME_PREFIX, "~");
+// `home` is the real home directory, never a guess from the shape of the path: /Users/Shared, /home/dashboard
+// and "GET /Users/42" are not anyone's home. Only home itself or home plus "/..." becomes ~; with no home known nothing does.
+export function homePath(path, home = "") {
+  const p = String(path ?? "");
+  const h = String(home ?? "").replace(/\/+$/, "");
+  if (!h) return p;
+  return p === h || p.startsWith(`${h}/`) ? `~${p.slice(h.length)}` : p;
 }
 
 // A path at most `max` cells wide: home as ~, and when that is still too long the middle goes but the last
 // two segments stay (`~/…/hooks/threads.mjs`), keeping as much of the head as fits. Too short even for that: its tail.
-export function tidyPath(path, max) {
-  const p = homePath(path);
+export function tidyPath(path, max, home = "") {
+  const p = homePath(path, home);
   if (p.length <= max) return p;
   const parts = p.split("/");
   if (parts.length > 3) {
@@ -1383,9 +1387,10 @@ export function tidyPath(path, max) {
 
 // A line of text with home shown as ~ in every path in it and, when the line is wider than `width`, the
 // longest paths shortened (each keeps its last two segments) so that it fits. When even that would not
-// fit, the paths stay whole: the caller clips the line and a shortened path would only lose detail early.
-export function tidyPaths(text, width = Infinity) {
-  const out = String(text ?? "").replace(PATH_WORD, (_, lead, p) => lead + homePath(p));
+// fit, every path still goes to its floor (`~/…/parent/file`): the caller clips the line, and that clip then
+// takes the prose after the paths instead of the middle of the first long path.
+export function tidyPaths(text, width = Infinity, home = "") {
+  const out = String(text ?? "").replace(PATH_WORD, (_, lead, p) => lead + homePath(p, home));
   if (out.length <= width) return out;
   const words = [...out.matchAll(PATH_WORD)]
     .map((m) => ({ at: m.index + m[1].length, text: m[2] }))
@@ -1394,6 +1399,7 @@ export function tidyPaths(text, width = Infinity) {
   let excess = out.length - width;
   const cuts = [];
   for (const w of words) {
+    // each path gives up what the line is over by, down to its floor at most; a line too long for that has every path at its floor
     if (excess <= 0) break;
     const parts = w.text.split("/");
     const floor = `${parts[0]}/…/${parts.slice(-2).join("/")}`.length;
@@ -1403,23 +1409,38 @@ export function tidyPaths(text, width = Infinity) {
       excess -= w.text.length - short.length;
     }
   }
-  if (excess > 0) return out;
   let result = out;
   for (const c of cuts.sort((a, b) => b.at - a.at)) result = result.slice(0, c.at) + c.short + result.slice(c.at + c.text.length);
   return result;
 }
 
-// Markdown out of a model's words, for a pane that draws plain text: `**`/`__` emphasis, backticks, leading #
-// headings and [text](url) links (a code span is left alone, so `__init__` keeps its underscores).
-export function plainText(s) {
-  return String(s ?? "")
-    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "")
-    .replace(/`([^`\n]+)`|\[([^\]\n]+)\]\([^)\s]*\)|(\*\*|__)(\S(?:[^\n]*?\S)?)\3/g, (_, code, link, _mark, strong) => code ?? link ?? strong)
-    .replace(/`/g, "");
-}
+// Markup the pane draws as plain text, tried in this order at each position so a code span is taken whole
+// first (`__init__` keeps its underscores) and a mark only counts where prose would put one:
+//   `code`      its text
+//   [text](url) the text, but not after a word or bracket (`handlers[i](event)` is an index and a call)
+//   **strong**  not after a word, "*" or "/" and not before one (`x**2 + y**2`, `src/**/*.ts` are not emphasis)
+//   __strong__  only around words with a space inside and no __ of their own (`__init__`, `__main__`, `my__file__name`
+//               are names, and so is each in "the __init__ method and the __call__ method")
+const MARKUP = /`([^`\n]+)`|(?<![\w\])])\[([^\]\n]+)\]\([^)\s]*\)|(?<![\w*/])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*/])|(?<!\w)__(?=\S)((?:(?!__)[^\n])*?\s(?:(?!__)[^\n])*?)(?<=\S)__(?!\w)/g;
+const FENCE = /^[ \t]{0,3}`{3,}[^`]*$/;
 
-// plainText for a transcript line, which leads with a tag column ("says  ## Done"): the tag stays, the words are cleaned.
-export function plainTail(line) {
-  const m = /^(\S+\s+)([\s\S]*)$/.exec(String(line ?? ""));
-  return m ? m[1] + plainText(m[2]) : plainText(line);
+// Markdown out of a model's words, for a pane that draws plain text: emphasis, backticks, leading #
+// headings and [text](url) links. A fenced block is code and is left as written (a `# comment` or `**kwargs`
+// in it is not markdown); the fence line itself loses its backticks, as any backtick does.
+export function plainText(s) {
+  let isFenced = false;
+  return String(s ?? "")
+    .split("\n")
+    .map((line) => {
+      if (FENCE.test(line)) {
+        isFenced = !isFenced;
+        return line.replace(/`/g, "");
+      }
+      if (isFenced) return line;
+      return line
+        .replace(/^[ \t]{0,3}#{1,6}[ \t]+/, "")
+        .replace(MARKUP, (_, code, link, strong, emphasis) => code ?? link ?? strong ?? emphasis)
+        .replace(/`/g, "");
+    })
+    .join("\n");
 }

@@ -102,7 +102,6 @@ import {
   keyLabel,
   paneMoney,
   paneTime,
-  plainTail,
   plainText,
   tidyPath,
   tidyPaths,
@@ -550,6 +549,8 @@ export function register(on, options) {
     const { value: view = EMPTY_VIEW } = await $.state.get(VIEW);
     const { value: ui = EMPTY_UI } = await $.state.get(UI);
     const { value: detail = EMPTY_DETAIL } = await $.state.get(DETAIL);
+    // the real home, so only it shows as ~ (a path shaped like a home, /Users/Shared, is left alone)
+    const home = (await $.env.get("HOME")) ?? "";
     const width = Math.max(40, e.props.bodyColumns ?? 100);
     const isWide = width >= 96;
     const leftW = isWide ? Math.min(44, Math.floor(width * 0.36)) : width;
@@ -591,7 +592,8 @@ export function register(on, options) {
     const hasNew = shown.some(isUnread);
     // marker (3), dot (1), three gaps, then the model, "new" and cost columns
     const rowFixed = 3 + 1 + 3 + chipW + (hasNew ? 4 : 0) + (costW ? 1 + costW : 0);
-    const titleW = Math.max(12, Math.min(leftW - rowFixed, Math.max(0, ...shown.map((t) => titleOf(t).length + 3))));
+    // what is left of the column after the fixed cells, never more: a floor above that overflows the column by the difference
+    const titleW = Math.max(4, Math.min(leftW - rowFixed, Math.max(0, ...shown.map((t) => titleOf(t).length + 3))));
     const row = (t, i, indent) => {
       const hotkey = i < 9 ? String(i + 1) : undefined;
       const isSel = selected && t.id === selected.id;
@@ -647,7 +649,8 @@ export function register(on, options) {
       }
     }
     const totalCost = mine.reduce((a, t) => a + (t.costUsd ?? 0), 0);
-    tree.push(dim(`${view.threads.filter((t) => LIVE.has(t.status)).length} live · cap ${view.cap}${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""}`, leftW));
+    // every lead's threads share the cap, so this counts slots; the header's "N live" counts this chat's threads only
+    tree.push(dim(`${view.threads.filter((t) => LIVE.has(t.status)).length} of ${view.cap} slots in use${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""}`, leftW));
     if (archivedCount) {
       tree.push(
         Button({
@@ -685,7 +688,7 @@ export function register(on, options) {
           }),
         );
       }
-      right.push(dim(`handoffs in ${tidyPath(plan.handoffDir, rightW - 12)}`, rightW));
+      right.push(dim(`handoffs in ${tidyPath(plan.handoffDir, rightW - 12, home)}`, rightW));
       plan.phases.forEach((ph, i) => {
         const th = byId.get(ph.threadId);
         right.push(
@@ -699,7 +702,7 @@ export function register(on, options) {
             ],
           }),
         );
-        if (ph.handoffPath) right.push(dim(`   handoff ${tidyPath(ph.handoffPath, rightW - 11)}`, rightW));
+        if (ph.handoffPath) right.push(dim(`   handoff ${tidyPath(ph.handoffPath, rightW - 11, home)}`, rightW));
         if (ph.note) right.push(dim(`   ${ph.note}`, rightW));
       });
       const chain = plan.phases.map((ph) => ph.threadId || "·").join(" → ");
@@ -719,48 +722,54 @@ export function register(on, options) {
       const needsDecision = t.status === "needs-you" && !isInline;
       const verified = t.verifiedModel ? t.verifiedModel : "not seen yet";
 
-      // who it is and what it is doing
-      const info = [];
-      info.push(
+      // who it is and what it is doing: the title, then the status line, which carries the folder when the pane is stacked (narrow) so that row is not spent on it
+      const who = [];
+      who.push(
         Box({
           flexDirection: "row",
           gap: 1,
           children: [Text({ bold: true, wrap: "truncate", children: clip(shortTitle(t.title), Math.max(8, rightW - t.id.length - 1)) }), Text({ dimColor: true, children: t.id })],
         }),
       );
-      info.push(
+      const statusText = `${dotOf(t.status)} ${t.status}`;
+      const folder = `${tidyPath(t.cwd, isInline ? 40 : valueW, home)}${isInline ? ` · inline agent ${t.agentId}` : ""}`;
+      who.push(
         Box({
           flexDirection: "row",
           gap: 1,
           children: [
-            Text({ color: colorOf(t.status), children: `${dotOf(t.status)} ${t.status}` }),
-            dim(`· ${age((view.refreshedAt || 0) - (t.createdAt || 0))} old · ${t.permissionMode}`, rightW - 16),
+            Text({ color: colorOf(t.status), children: statusText }),
+            dim(`· ${age((view.refreshedAt || 0) - (t.createdAt || 0))} old · ${t.permissionMode}${isWide ? "" : ` · ${folder}`}`, rightW - statusText.length - 1),
           ],
         }),
       );
-      info.push(field("Model", `asked ${t.requestedModel} · running ${verified}${t.effort ? ` · effort ${t.effort}` : ""}`));
-      info.push(field("Folder", `${tidyPath(t.cwd, isInline ? 40 : valueW)}${isInline ? ` · inline agent ${t.agentId}` : ""}`));
-      info.push(field("Task", tidyPaths(oneLine(t.task), valueW)));
-      info.push(field("Cost", `${paneMoney(t.costUsd)} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
-      if (t.lastReport?.text) info.push(field("Report", tidyPaths(oneLine(plainText(t.lastReport.text)), valueW), "cyan"));
-      if (t.forkedFrom) info.push(field(t.handedOff ? "Handoff" : "Forked", `from "${t.forkedFrom.title}" with ${t.forkedFrom.include === "full" ? "its transcript" : "a summary"}`));
-      if (t.desktop?.length) info.push(field("Desk", `drives ${t.desktop.join(", ")} through Codex computer use (leased to this thread)`));
+
+      // the reference rows, under the actions: what it runs on, where, what it was asked, what it cost
+      const details = [];
+      // the reason for a status that needs the person, first, so it reads straight after the buttons that answer it
+      if (t.status === "needs-you" && t.prompt && isInline) {
+        details.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
+      } else if (t.status === "needs-you" && t.prompt) {
+        details.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
+      }
+      if (t.status === "needs-login") details.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
+      if (t.status === "needs-trust") {
+        details.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
+      }
+      details.push(field("Model", `asked ${t.requestedModel} · running ${verified}${t.effort ? ` · effort ${t.effort}` : ""}`));
+      if (isWide) details.push(field("Folder", folder));
+      details.push(field("Task", tidyPaths(oneLine(t.task), valueW, home)));
+      details.push(field("Cost", `${paneMoney(t.costUsd)} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
+      if (t.lastReport?.text) details.push(field("Report", tidyPaths(oneLine(plainText(t.lastReport.text)), valueW, home), "cyan"));
+      if (t.forkedFrom) details.push(field(t.handedOff ? "Handoff" : "Forked", `from "${t.forkedFrom.title}" with ${t.forkedFrom.include === "full" ? "its transcript" : "a summary"}`));
+      if (t.desktop?.length) details.push(field("Desk", `drives ${t.desktop.join(", ")} through Codex computer use (leased to this thread)`));
       if (t.worktree) {
         const w = t.worktree;
         const state = w.removed ? "removed (no changes)" : w.kept ? `kept${w.commits ? `, ${w.commits} commit${w.commits === 1 ? "" : "s"}` : ""}${w.dirty ? ", uncommitted changes" : ""} · merge: git merge ${w.branch}` : "isolated";
-        info.push(field("Worktree", `${w.branch} · ${state}`));
-      }
-      if (t.status === "needs-you" && t.prompt && isInline) {
-        info.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
-      } else if (t.status === "needs-you" && t.prompt) {
-        info.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
-      }
-      if (t.status === "needs-login") info.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
-      if (t.status === "needs-trust") {
-        info.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
+        details.push(field("Worktree", `${w.branch} · ${state}`));
       }
 
-      // what you can do: the main actions first (Approve is the one primary button), Close set apart at the end
+      // what you can do, straight under the status line (Approve is the one primary button), Close thread set apart at the end
       const actions = [];
       const steer = btn("steer", "Steer", "s", () => patchUi($, (u) => ({ ...u, steering: !u.steering })));
       const interrupt = btn("interrupt", isInline ? "Stop" : "Interrupt", "i", () => noticeOf($, () => interruptThread($, t)));
@@ -783,7 +792,7 @@ export function register(on, options) {
           gap: 1,
           children: [
             Box({ flexDirection: "row", flexWrap: "wrap", gap: 1, children: primary }),
-            ...(t.status !== "closed" ? [btn("close-thread", "Close", "x", () => noticeOf($, () => closeThread($, t, { from: "pane" })))] : []),
+            ...(t.status !== "closed" ? [btn("close-thread", "Close thread", "x", () => noticeOf($, () => closeThread($, t, { from: "pane" })))] : []),
           ],
         }),
       );
@@ -833,7 +842,7 @@ export function register(on, options) {
           }),
         );
       }
-      if (ui.armedClose?.id === t.id) actions.push(Text({ color: "magenta", wrap: "truncate", children: clip("Press Close again within 10 seconds to close it.", rightW) }));
+      if (ui.armedClose?.id === t.id) actions.push(Text({ color: "magenta", wrap: "truncate", children: clip("Press Close thread again within 10 seconds to close it.", rightW) }));
       if (ui.renaming && Input) {
         actions.push(
           Input({
@@ -895,7 +904,10 @@ export function register(on, options) {
       else if (detail.lines.length === 0) {
         feed.push(dim(isScreen ? (isInline ? "No activity seen yet" : "The screen is empty or the thread is gone") : "Nothing in the transcript yet", rightW));
       }
-      else if (isRaw) for (const l of detail.lines) feed.push(Text({ wrap: "truncate", dimColor: true, children: clip(tidyPaths(l, rightW), rightW) }));
+      else if (isRaw) {
+        // trailing space is not content: measure the line, not its padding (a padded line counts the padding as excess and cuts paths for it)
+        for (const l of detail.lines) feed.push(Text({ wrap: "truncate", dimColor: true, children: clip(tidyPaths(String(l ?? "").trimEnd(), rightW, home), rightW) }));
+      }
       else {
         // items are "[HH:MM:SS ]tag  text": dim clock and tag columns instead of space padding, which draws in another font on the desktop
         for (const l of detail.lines) {
@@ -904,15 +916,18 @@ export function register(on, options) {
           const cols = m?.[1] ? [Box({ width: 8, flexShrink: 0, children: [Text({ dimColor: true, children: m[1] })] })] : [];
           cols.push(
             Box({ width: 5, flexShrink: 0, children: [Text({ dimColor: true, children: m ? m[2] : "" })] }),
-            Text({ wrap: "truncate", dimColor: isScreen, children: clip(tidyPaths(plainText(m ? m[3] : l), textW), textW) }),
+            Text({ wrap: "truncate", dimColor: isScreen, children: clip(tidyPaths(plainText(m ? m[3] : l), textW, home), textW) }),
           );
           feed.push(Box({ flexDirection: "row", gap: 1, children: cols }));
         }
       }
 
+      // the actions come right after the status line, ahead of the reference rows: they are what is reached for, and at
+      // the default pane height (a third of the screen) the rows below the first dozen are not seen
       right.push(
-        Box({ flexDirection: "column", children: info }),
-        Box({ flexDirection: "column", marginTop: 1, children: actions }),
+        Box({ flexDirection: "column", children: who }),
+        Box({ flexDirection: "column", children: actions }),
+        Box({ flexDirection: "column", children: details }),
         Box({ flexDirection: "column", marginTop: 1, children: feed }),
       );
     }
@@ -920,21 +935,22 @@ export function register(on, options) {
     const liveCount = mine.filter((t) => LIVE.has(t.status)).length;
     const stamp = paneTime(view.refreshedAt);
     const meta = `· ${liveCount} live${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""} · ${stamp ? `updated ${stamp}` : "not refreshed yet"}`;
-    // the title and its dim facts on the left, the pane's controls right-aligned (they wrap under it when the pane is narrow)
+    // the title and its dim facts on the left, the pane's controls right-aligned. Where the two do not fit one row the controls
+    // wrap under the title, so the facts may take the whole width; clipping them to what the controls leave cut them (· $0.94 est. · updated 08…)
+    // even though the controls had wrapped away from them.
     const headSpecs = [
       ["refresh", "Refresh", "r", () => refresh($, { force: true })],
       ...((view.plans ?? []).length ? [["plan-view", ui.planView ? "Threads" : "Plan", "p", () => patchUi($, (u) => ({ ...u, planView: !u.planView }))]] : []),
       // a desktop draws a dismiss Button as its own close control at the pane's edge
       ["close-pane", "Close", "c", () => $.ui.close({ id: PANE }), { role: "dismiss" }],
     ];
-    const buttonsW = headSpecs.reduce((a, s) => a + keyLabel(s[1], s[2], isDesktop).length + 5, 0);
     const head = Box({
       flexDirection: "row",
       flexWrap: "wrap",
       justifyContent: "space-between",
       gap: 1,
       children: [
-        Box({ flexDirection: "row", gap: 1, children: [Text({ bold: true, children: "Threads" }), dim(meta, Math.max(10, width - 8 - buttonsW))] }),
+        Box({ flexDirection: "row", gap: 1, children: [Text({ bold: true, children: "Threads" }), dim(meta, width - 8)] }),
         Box({ flexDirection: "row", gap: 1, children: headSpecs.map((s) => btn(...s)) }),
       ],
     });
@@ -946,12 +962,11 @@ export function register(on, options) {
         ? "Click a thread or any button. You can also ask in the chat: show, steer, fork, wait for or close threads."
         : "Click a thread or any button. Keys: ctrl+x then tab gives the pane the keyboard; the letter on each button is its key.",
     });
-    // one blank row between the sections
+    // no blank row under the head (its buttons already set it apart); the stacked layout keeps one between the tree and the detail
     const body = isWide
       ? Box({
           flexDirection: "row",
           gap: 2,
-          marginTop: 1,
           children: [
             Box({ flexDirection: "column", width: leftW, children: tree }),
             Box({ flexDirection: "column", width: rightW, children: right }),
@@ -959,7 +974,6 @@ export function register(on, options) {
         })
       : Box({
           flexDirection: "column",
-          marginTop: 1,
           children: [Box({ flexDirection: "column", children: tree }), Box({ flexDirection: "column", marginTop: 1, children: right })],
         });
     return Box({ flexDirection: "column", children: [head, ...(mine.length === 0 ? [hint] : []), body] });
@@ -2361,7 +2375,7 @@ async function armPaneClose($, t) {
     return closeNow($, t);
   }
   await patchUi($, (u) => ({ ...u, armedClose: { id: t.id, at: now } }));
-  return `Press Close again within 10 seconds to close ${shortTitle(t.title)}.`;
+  return `Press Close thread again within 10 seconds to close ${shortTitle(t.title)}.`;
 }
 
 // Every open thread of a plan.
@@ -2640,6 +2654,15 @@ function costChip(t) {
 
 // ---- show and open -------------------------------------------------------------------------------------------------
 
+// Body rows asked for when the pane sits inline above the prompt. Left out, the engine gives a third of the screen
+// (about 13 rows at 45), which cut off the actions and the feed heading. It is a request: the engine clamps it to the
+// room the layout spares, a size the person dragged wins, and a docked pane (fullscreen, from 110 columns) uses columns instead.
+const PANE_ROWS = 24;
+
+function openPane($) {
+  return $.ui.open({ id: PANE, title: PANE_TITLE, rows: PANE_ROWS });
+}
+
 async function showPane($, { id, plan } = {}) {
   await refresh($, { force: true });
   if (id) {
@@ -2648,7 +2671,7 @@ async function showPane($, { id, plan } = {}) {
     await patchUi($, (u) => ({ ...u, selected: found.thread.id, planView: false, showArchived: u.showArchived || Boolean(found.thread.archived), showOthers: u.showOthers || !found.thread.isMine }));
   }
   if (plan) await patchUi($, (u) => ({ ...u, planView: true }));
-  const opened = await $.ui.open({ id: PANE, title: PANE_TITLE });
+  const opened = await openPane($);
   await refresh($, { force: true });
   if (!opened.isPlaced) return `The Threads pane could not be placed (${opened.reason}). Here is the list instead:\n${await listText($, { forModel: true })}`;
   const view = await viewThreads($);
@@ -3818,7 +3841,7 @@ async function togglePane($) {
     return "Threads pane closed.";
   }
   await refresh($, { force: true });
-  const opened = await $.ui.open({ id: PANE, title: PANE_TITLE });
+  const opened = await openPane($);
   await refresh($, { force: true });
   if (!opened.isPlaced) return `The Threads pane could not be placed (${opened.reason}).\n${await listText($)}`;
   const view = await viewThreads($);

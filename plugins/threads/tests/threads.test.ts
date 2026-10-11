@@ -14,6 +14,7 @@ import {
   threadTitle,
   toolLine,
   buildPhasePrompt,
+  clip,
   gateAfter,
   handoffPathFor,
   stepPlan,
@@ -29,7 +30,7 @@ import {
   keyLabel,
   paneMoney,
   paneTime,
-  plainTail,
+  homePath,
   plainText,
   tidyPath,
   tidyPaths,
@@ -70,6 +71,7 @@ type World = {
   answers: Array<string | null>;
   toasts: string[];
   panes: Set<string>;
+  opened: any[]; // every $.ui.open the plugin made, as the engine saw it
   loggedIn: boolean;
   authCalls: number;
   now: number;
@@ -120,6 +122,7 @@ function fresh(over: Partial<World> = {}): World {
     answers: [],
     toasts: [],
     panes: new Set(),
+    opened: [],
     loggedIn: true,
     authCalls: 0,
     now: T0,
@@ -220,6 +223,7 @@ function engine(on: any, w: World) {
     return { value: undefined };
   });
   on("ui.open", ($: any, e: any) => {
+    w.opened.push(e);
     w.panes.add(e.id);
     return { value: { isPlaced: true } };
   });
@@ -838,7 +842,9 @@ describe("threads: steering", () => {
     await ui.press({ key: `sel:${scout.id}` });
     await ui.press({ key: "close-thread" }); // the ask rejects: armed
     expect(w.tmux.has(scout.tmux)).toBe(true);
-    expect(await ui.find({ type: "Text", text: /Press Close again within 10 seconds/ })).toBeDefined();
+    // the thread action is "Close thread": the header's "Close" shuts the pane, so a bare "Close" here would name either
+    expect(await ui.find({ type: "Text", text: /^Press Close thread again within 10 seconds to close it\.$/ })).toBeDefined();
+    expect(await ui.find({ type: "Text", text: /Press Close again/ })).toBeUndefined();
     await ui.press({ key: "close-thread" });
     expect(w.tmux.has(scout.tmux)).toBe(false);
     await ui.unmount();
@@ -2440,7 +2446,7 @@ describe("threads: Codex computer use", () => {
 
 describe("threads: pane polish", () => {
   const SURFACES = ["terminal", "desktop"] as const;
-  const MARKDOWN = "## Done\n**3 files** changed in `/home/tester/work/app/src/a.ts`, see [the notes](https://x.y/n) and __this__\n- all pass";
+  const MARKDOWN = "## Done\n**3 files** changed in `/home/tester/work/app/src/a.ts`, see [the notes](https://x.y/n) and __this one__\n- all pass";
 
   const mountPane = ($: any, surface: string, bodyColumns = 140) =>
     $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: { ...PANE_PROPS, bodyColumns } } as any);
@@ -2515,7 +2521,8 @@ describe("threads: pane polish", () => {
     });
 
     test("plainText: emphasis, backticks, headings and links go; code spans keep their text", () => {
-      expect(plainText("**bold** and __strong__ words")).toBe("bold and strong words");
+      // __x__ is emphasis only around words (a space inside): a lone __name__ is an identifier
+      expect(plainText("**bold** and __strong words__ end")).toBe("bold and strong words end");
       expect(plainText("run `npm test` now")).toBe("run npm test now");
       expect(plainText("## Summary\nbody\n### Deeper\nmore")).toBe("Summary\nbody\nDeeper\nmore");
       expect(plainText("see [the notes](https://x.y/n?a=1) for more")).toBe("see the notes for more");
@@ -2527,40 +2534,106 @@ describe("threads: pane polish", () => {
       expect(plainText(undefined)).toBe("");
     });
 
-    test("plainTail: a transcript line keeps its tag column", () => {
-      expect(plainTail("says  ## Done: **3 files** in `src`")).toBe("says  Done: 3 files in src");
-      expect(plainTail("tool  Bash ls -la")).toBe("tool  Bash ls -la");
+    test("plainText: names, maths, globs, indexing and calls keep their marks", () => {
+      // dunder names and a name with __ inside are identifiers, not emphasis
+      expect(plainText("the __init__ method")).toBe("the __init__ method");
+      for (const name of ["__pycache__", "__main__", "my__file__name.py"]) expect(plainText(name)).toBe(name);
+      // two names in one line must not pair up as one emphasis
+      expect(plainText("import __main__ then __pycache__/x.pyc")).toBe("import __main__ then __pycache__/x.pyc");
+      expect(plainText("the __init__ method and the __call__ method")).toBe("the __init__ method and the __call__ method");
+      // a power is not strong text
+      expect(plainText("x**2 + y**2")).toBe("x**2 + y**2");
+      expect(plainText("2**10")).toBe("2**10");
+      // a recursive glob is not strong text either
+      expect(plainText("src/**/*.ts and lib/**/*.ts")).toBe("src/**/*.ts and lib/**/*.ts");
+      // an index and a call is not a link
+      expect(plainText("handlers[i](event)")).toBe("handlers[i](event)");
+      expect(plainText("see [the docs](https://x.y) and handlers[i](event)")).toBe("see the docs and handlers[i](event)");
+      // single asterisks and star-args are left alone
+      expect(plainText("a *b* c")).toBe("a *b* c");
+      expect(plainText("def f(*args, **kwargs)")).toBe("def f(*args, **kwargs)");
+      // real markup around code still goes, and emphasis needs a space inside to count for __
+      expect(plainText("**bold `code`**")).toBe("bold code");
+      expect(plainText("__two words__ and __one__")).toBe("two words and __one__");
+      expect(plainText("**bold** next to __it all__.")).toBe("bold next to it all.");
+    });
+
+    test("plainText: a fenced block is code, so its # comments and stars stay; a heading outside it still goes", () => {
+      const text = "## Result\nrun it:\n```python\n# comment\nx = 1  # note\n## not a heading\nf(*a, **kw)\n```\n### After\n# Title";
+      expect(plainText(text)).toBe("Result\nrun it:\npython\n# comment\nx = 1  # note\n## not a heading\nf(*a, **kw)\n\nAfter\nTitle");
+      // the same fence with no language, and a heading line by itself is still stripped
+      expect(plainText("```\n# keep\n```")).toBe("\n# keep\n");
+      expect(plainText("# Heading")).toBe("Heading");
+      expect(plainText("  ### Heading")).toBe("Heading");
+      // a # that is not at the start of the line is not a heading
+      expect(plainText("issue #12 and C# are fine")).toBe("issue #12 and C# are fine");
     });
 
     test("tidyPath: home is ~, a long path loses its middle but keeps its last two segments", () => {
-      expect(tidyPath("/Users/dawizkidmal/proj/a.ts", 40)).toBe("~/proj/a.ts");
-      expect(tidyPath("/home/tester/proj", 40)).toBe("~/proj");
-      expect(tidyPath("/work/app", 40)).toBe("/work/app");
+      expect(tidyPath("/Users/dawizkidmal/proj/a.ts", 40, "/Users/dawizkidmal")).toBe("~/proj/a.ts");
+      expect(tidyPath("/home/tester/proj", 40, "/home/tester")).toBe("~/proj");
+      expect(tidyPath("/work/app", 40, "/home/tester")).toBe("/work/app");
       const long = "/Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs";
-      expect(tidyPath(long, 24)).toBe("~/…/hooks/threads.mjs");
+      expect(tidyPath(long, 24, "/Users/me")).toBe("~/…/hooks/threads.mjs");
       // with room to spare it keeps as much of the head as fits
-      expect(tidyPath(long, 32)).toBe("~/.claude/…/hooks/threads.mjs");
+      expect(tidyPath(long, 32, "/Users/me")).toBe("~/.claude/…/hooks/threads.mjs");
       expect(tidyPath("/srv/data/shared/deep/dir/file.txt", 18)).toBe("/…/dir/file.txt");
       expect(tidyPath("src/very/deep/nest/of/dirs/file.ts", 24)).toBe("src/very/…/dirs/file.ts");
       // never wider than asked, even when no middle form fits: the tail survives
-      for (const max of [1, 5, 12, 20]) expect(tidyPath(long, max).length).toBeLessThanOrEqual(max);
-      expect(tidyPath(long, 12).endsWith("threads.mjs")).toBe(true);
-      expect(tidyPath("/Users/me/a-very-long-single-file-name.txt", 10).length).toBeLessThanOrEqual(10);
+      for (const max of [1, 5, 12, 20]) expect(tidyPath(long, max, "/Users/me").length).toBeLessThanOrEqual(max);
+      expect(tidyPath(long, 12, "/Users/me").endsWith("threads.mjs")).toBe(true);
+      expect(tidyPath("/Users/me/a-very-long-single-file-name.txt", 10, "/Users/me").length).toBeLessThanOrEqual(10);
+    });
+
+    test("home: only the real home becomes ~; a path that merely looks like one is left alone", () => {
+      const home = "/Users/dawizkidmal";
+      expect(homePath(home, home)).toBe("~");
+      expect(homePath(`${home}/work/app`, home)).toBe("~/work/app");
+      expect(homePath(`${home}/`, home)).toBe("~/");
+      expect(homePath("/Users/Shared/data/file.txt", home)).toBe("/Users/Shared/data/file.txt"); // not ~/data/file.txt
+      expect(homePath("/Users/42", home)).toBe("/Users/42");
+      expect(homePath("/home/dashboard", home)).toBe("/home/dashboard"); // not ~
+      // a longer name that starts with home is another directory
+      expect(homePath(`${home}-old/x`, home)).toBe(`${home}-old/x`);
+      expect(homePath("/home/dashboard", "/home/dash")).toBe("/home/dashboard");
+      // a trailing slash on home is no different, and no home known means nothing collapses
+      expect(homePath(`${home}/a`, `${home}/`)).toBe("~/a");
+      expect(homePath(`${home}/a`, "")).toBe(`${home}/a`);
+      expect(homePath(`${home}/a`)).toBe(`${home}/a`);
+      // inside a line, the same rule for each path
+      const line = "GET /Users/42 read /Users/Shared/data/file.txt and /home/dashboard but not ours at /Users/dawizkidmal/proj/a.ts or /Users/dawizkidmal";
+      expect(tidyPaths(line, Infinity, home)).toBe("GET /Users/42 read /Users/Shared/data/file.txt and /home/dashboard but not ours at ~/proj/a.ts or ~");
+      expect(tidyPath("/Users/Shared/data/file.txt", 80, home)).toBe("/Users/Shared/data/file.txt");
     });
 
     test("tidyPaths: home becomes ~ inside a line; a too-wide line shortens its longest paths", () => {
-      expect(tidyPaths("edit /Users/me/proj/a.ts and /home/me/b.ts now")).toBe("edit ~/proj/a.ts and ~/b.ts now");
-      expect(tidyPaths("fits as it is: /work/app/a.ts", 80)).toBe("fits as it is: /work/app/a.ts");
+      expect(tidyPaths("edit /Users/me/proj/a.ts and /home/me/b.ts now", Infinity, "/Users/me")).toBe("edit ~/proj/a.ts and /home/me/b.ts now");
+      expect(tidyPaths("fits as it is: /work/app/a.ts", 80, "/Users/me")).toBe("fits as it is: /work/app/a.ts");
       const line = "says  fixed /Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs in one go";
-      const fit = tidyPaths(line, 70);
+      const fit = tidyPaths(line, 70, "/Users/me");
       expect(fit.length).toBeLessThanOrEqual(70);
       expect(fit).toMatch(/^says {2}fixed ~\/.*…\/hooks\/threads\.mjs in one go$/);
-      // a line too long to fit even with every path shortened keeps its paths whole, for the caller's clip to cut
+      // a line too long to fit even with every path shortened still has each path at its floor, so the caller's clip takes
+      // the prose after it and not the middle of the path (this used to leave the path whole and clip it mid-name)
       const prose = "Done: changed /Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs and then a very long explanation follows here";
-      expect(tidyPaths(prose, 60)).toBe(prose.replace("/Users/me", "~"));
+      expect(tidyPaths(prose, 60, "/Users/me")).toBe("Done: changed ~/…/hooks/threads.mjs and then a very long explanation follows here");
       // a URL is not a path, and a slash command stays as typed
       expect(tidyPaths("see https://example.com/a/b/c/d/e and run /threads new", 20)).toBe("see https://example.com/a/b/c/d/e and run /threads new");
       expect(tidyPaths(undefined)).toBe("");
+    });
+
+    test("tidyPaths: a 500-character task keeps the end of its long path visible after the caller's clip", () => {
+      const long = "/Users/me/.claude/local-marketplaces/claude-mods-computer-use-threads/plugins/threads/hooks/threads.mjs";
+      const task = `Review ${long} for races, then ${"explain every finding at length ".repeat(15)}`.slice(0, 500);
+      expect(task).toHaveLength(500);
+      for (const width of [40, 60, 90]) {
+        const shown = clip(tidyPaths(task, width, "/Users/me"), width);
+        expect(shown).toContain("~/…/hooks/threads.mjs");
+        expect(shown.length).toBeLessThanOrEqual(width);
+      }
+      // another path in the same line is at its floor too, not only the first
+      const two = `${long} and ${long.replace("threads.mjs", "core.mjs")} ${"x".repeat(300)}`;
+      expect(clip(tidyPaths(two, 80, "/Users/me"), 80)).toMatch(/^~\/…\/hooks\/threads\.mjs and ~\/…\/hooks\/core\.mjs x+/);
     });
   });
 
@@ -2568,7 +2641,7 @@ describe("threads: pane polish", () => {
     const { critic } = await paneWorld($, on, { critic: "needs-you" });
     const expected: Record<string, [string, string]> = {
       refresh: ["Refresh", "r"], "close-pane": ["Close", "c"], view: ["Screen", "w"], approve: ["Approve", "y"], deny: ["Deny", "n"],
-      open: ["Open", "o"], more: ["Less", "d"], "close-thread": ["Close", "x"], steer: ["Steer", "s"], interrupt: ["Interrupt", "i"],
+      open: ["Open", "o"], more: ["Less", "d"], "close-thread": ["Close thread", "x"], steer: ["Steer", "s"], interrupt: ["Interrupt", "i"],
       model: ["Model", "m"], effort: ["Effort", "e"], pin: ["Pin", "u"], archive: ["Archive", "v"], rename: ["Rename", "t"],
     };
     for (const surface of SURFACES) {
@@ -2703,7 +2776,7 @@ describe("threads: pane polish", () => {
     for (const surface of SURFACES) {
       const ui = await mountPane($, surface);
       await ui.press({ key: `sel:${scout.id}` });
-      const report = await ui.find({ type: "Text", text: /^Done 3 files changed in ~\/work\/app\/src\/a\.ts, see the notes and this/ });
+      const report = await ui.find({ type: "Text", text: /^Done 3 files changed in ~\/work\/app\/src\/a\.ts, see the notes and this one/ });
       expect(report).toBeDefined();
       expect(report?.props.color).toBe("cyan");
       expect(report?.text).not.toMatch(/\*\*|__|`|\]\(|#/);
@@ -2732,7 +2805,7 @@ describe("threads: pane polish", () => {
       expect(await ui.find({ type: "Text", text: "$0.91" })).toBeDefined(); // its tree row
       expect(await ui.find({ type: "Text", text: "<$0.01" })).toBeDefined(); // the critic's trace
       expect(await ui.find({ type: "Text", text: /^· 3 live · \$0\.92 est\. · updated / })).toBeDefined(); // the header
-      expect(await ui.find({ type: "Text", text: /^3 live · cap \d+ · \$0\.92 est\.$/ })).toBeDefined(); // the tree footer
+      expect(await ui.find({ type: "Text", text: /^3 of \d+ slots in use · \$0\.92 est\.$/ })).toBeDefined(); // the tree footer
       expect(await ui.findAll({ type: "Text", text: /\$\d+\.\d{3}/ })).toHaveLength(0);
       await ui.unmount();
     }
@@ -2803,7 +2876,8 @@ describe("threads: pane polish", () => {
     }
   });
 
-  // wide: the tree left and the detail right; narrow: stacked. Each section is one blank row apart.
+  // wide: the tree left and the detail right; narrow: stacked. No blank row under the head or between the status line and the
+  // actions; the stacked layout keeps one between the tree and the detail, and the feed is one blank row below the details.
   const STATES: Array<[string, Parameters<typeof paneWorld>[2]]> = [
     ["idle", { scout: "idle" }],
     ["working", {}],
@@ -2821,10 +2895,11 @@ describe("threads: pane polish", () => {
             if (more) await ui.press({ key: "more" });
             const tree = await ui.drawn();
             const body = (tree.children as any[]).at(-1);
-            expect(body.props.marginTop).toBe(1);
+            expect(body.props.marginTop).toBeUndefined();
             expect(body.props.flexDirection).toBe(cols >= 96 ? "row" : "column");
+            if (cols < 96) expect(body.children[1].props.marginTop).toBe(1);
             expect(pathTo(tree, "view").at(-3).props.marginTop).toBe(1); // the transcript section
-            expect(pathTo(tree, "close-thread").at(-3).props.marginTop).toBe(1); // the actions
+            expect(pathTo(tree, "close-thread").at(-3).props.marginTop).toBeUndefined(); // the actions follow the status line
             expect(Boolean(await ui.find({ key: "rename" }))).toBe(more);
           }
           await ui.press({ key: "more" });
@@ -2845,6 +2920,245 @@ describe("threads: pane polish", () => {
         expect(await ui.find({ type: "Text", text: "Start a thread" })).toBeDefined();
         await ui.unmount();
       }
+    }
+  });
+
+  // ---- QA defects: the fold, clipped paths and header, the real home, the counts, the tree, the Close labels ----
+
+  // rows a node takes if every Text, Button and Input is one line: a column stacks its children, a row (a wrapping one too)
+  // is as tall as its tallest, a marginTop adds. Enough to say how far down the pane an element sits.
+  const heightOf = (n: any): number => {
+    if (!n || typeof n === "string") return 0;
+    const margin = n.props?.marginTop ?? 0;
+    if (n.type !== "Box") return 1 + margin;
+    const kids = (n.children ?? []).map(heightOf);
+    return margin + (n.props?.flexDirection === "row" ? Math.max(0, ...kids) : kids.reduce((a: number, b: number) => a + b, 0));
+  };
+  const rowsAbove = (root: any, key: string): number => {
+    const path = pathTo(root, key);
+    let above = 0;
+    path.forEach((node, i) => {
+      above += node.props?.marginTop ?? 0;
+      const parent = path[i - 1];
+      if (parent && parent.props?.flexDirection !== "row") {
+        for (const sibling of parent.children) {
+          if (sibling === node) break;
+          above += heightOf(sibling);
+        }
+      }
+    });
+    return above;
+  };
+  // the width a tree row asks for: fixed-width Boxes as declared, text as long as it is, and the gaps
+  const widthOf = (n: any): number => {
+    if (typeof n === "string") return n.length;
+    if (n.props?.width !== undefined) return n.props.width;
+    return shows(n).join("").length;
+  };
+  const rowWidth = (row: any) => (row.children as any[]).reduce((a, c) => a + widthOf(c), 0) + (row.props.gap ?? 0) * (row.children.length - 1);
+  // a pane's first screenful at the default height (a third of 45 rows, less the frame's two)
+  const FIRST_ROWS = 13;
+
+  test("the pane asks for more rows than the default third of the screen, but not the whole screen", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "");
+    expect(w.opened.at(-1)).toMatchObject({ id: "threads", title: "Threads" });
+    const rows = w.opened.at(-1).rows;
+    // the default gives a third (13 body rows at 45); the engine clamps a larger ask to the room the layout spares
+    expect(rows).toBeGreaterThan(FIRST_ROWS);
+    expect(rows).toBeLessThanOrEqual(30);
+    // the model's threads_show opens it the same way
+    await threads($, ""); // closes
+    w.opened.length = 0;
+    await $.tool.call({ tool: "mcp__threads__threads_show" } as any);
+    expect(w.opened.at(-1)?.rows).toBe(rows);
+  });
+
+  test("the actions sit right under the status line, ahead of the detail rows, inside the first screenful at 80 and 140 columns", async ($, on) => {
+    const { scout } = await paneWorld($, on, { scout: "idle" }, (w, t) => {
+      const reg = registry(w);
+      reg.threads.find((x: any) => x.id === t.id).lastReport = { text: "found it", at: T0 + 5000, source: "peer" };
+      w.fs.set(REG, JSON.stringify(reg));
+    });
+    for (const surface of SURFACES) {
+      for (const cols of [140, 80]) {
+        const ui = await mountPane($, surface, cols);
+        await ui.press({ key: `sel:${scout.id}` });
+        const tree = await ui.drawn();
+        // the selected thread's column, in order: who (title, status), the actions, the detail rows, the feed
+        const right = pathTo(tree, "close-thread").at(-4);
+        const [who, actions, details, feed] = right.children;
+        expect(who.children).toHaveLength(2);
+        expect(shows(who.children[1])[0]).toBe("○ idle");
+        expect(nodeOf(actions, "open")).toBeDefined();
+        expect(nodeOf(actions, "more")).toBeDefined();
+        expect(nodeOf(actions, "close-thread")).toBeDefined();
+        expect(nodeOf(details, "open")).toBeUndefined();
+        expect(shows(details.children[0])[0]).toBe("Model");
+        expect(nodeOf(feed, "view")).toBeDefined();
+        // nothing between the status line and the actions: they are adjacent rows
+        expect(heightOf(who)).toBe(2);
+        expect(actions.props.marginTop).toBeUndefined();
+        expect(rowsAbove(right, "open") - (right.props.marginTop ?? 0)).toBe(2); // title, status, then the buttons
+        // the actions are inside the first screenful, and ahead of Model, Task, Cost and Report in reading order
+        expect(rowsAbove(tree, "close-thread") + 1).toBeLessThanOrEqual(FIRST_ROWS);
+        const labels = shows(tree);
+        const at = (label: RegExp) => labels.findIndex((l) => label.test(l));
+        for (const label of [/^Model$/, /^Task$/, /^Cost$/, /^Report$/]) expect(at(label)).toBeGreaterThan(at(/Open$/));
+        if (cols >= 96) {
+          // wide: the feed heading and its Screen toggle show too (they were the 13th row, cut off, before)
+          expect(rowsAbove(tree, "view") + 1).toBeLessThanOrEqual(FIRST_ROWS - 1);
+        } else {
+          expect(rowsAbove(tree, "view") + 1).toBeGreaterThan(FIRST_ROWS); // stacked: the feed follows the tree and the details
+        }
+        await ui.unmount();
+      }
+    }
+  });
+
+  test("a stacked pane folds the Folder row into the status line; a wide one keeps the row", async ($, on) => {
+    const { scout } = await paneWorld($, on, { scout: "idle" });
+    for (const surface of SURFACES) {
+      const wide = await mountPane($, surface, 140);
+      await wide.press({ key: `sel:${scout.id}` });
+      expect(await wide.find({ type: "Text", text: "Folder" })).toBeDefined();
+      expect(await wide.find({ type: "Text", text: /^· \d+s old · \S+$/ })).toBeDefined();
+      await wide.unmount();
+      const narrow = await mountPane($, surface, 80);
+      await narrow.press({ key: `sel:${scout.id}` });
+      expect(await narrow.find({ type: "Text", text: "Folder" })).toBeUndefined();
+      expect(await narrow.find({ type: "Text", text: /^· \d+s old · \S+ · \/work\/app$/ })).toBeDefined();
+      await narrow.unmount();
+    }
+  });
+
+  test("an inline thread's folder and agent fold into the stacked status line too", async ($, on) => {
+    const w = fresh({ loggedIn: false });
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "");
+    const ui = await mountPane($, "terminal", 80);
+    expect(await ui.find({ type: "Text", text: "Folder" })).toBeUndefined();
+    expect(await ui.find({ type: "Text", text: /^· \d+s old · \S+ · \/work\/app · inline agent agent-1$/ })).toBeDefined();
+    await ui.unmount();
+  });
+
+  test("the header facts are never clipped by room the buttons do not use: whole at 80 and 60 columns, with the Plan button too", async ($, on) => {
+    const { w } = await paneWorld($, on, {}, (world, t) => {
+      world.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 }));
+    });
+    await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "auto", phases: PHASES } as any);
+    await threads($, "refresh");
+    expect(registry(w).plans).toHaveLength(1);
+    for (const surface of SURFACES) {
+      for (const cols of [80, 60]) {
+        const ui = await mountPane($, surface, cols);
+        expect(await ui.find({ key: "plan-view" })).toBeDefined();
+        const meta = await ui.find({ type: "Text", text: /^· \d+ live/ });
+        expect(meta?.text).toMatch(/^· \d+ live · \$\d+\.\d\d est\. · updated \d\d:\d\d$/);
+        expect(meta?.text).not.toContain("…");
+        await ui.unmount();
+      }
+    }
+  });
+
+  test("the tree's columns never overflow: every row fits its column at 96 and 97 columns, and around them", async ($, on) => {
+    // a row with a new chip and a cost is the widest: marker, dot, title, model, new, cost
+    const { scout } = await paneWorld($, on, { scout: "idle" }, (w, t) => {
+      const reg = registry(w);
+      reg.threads.find((x: any) => x.id === t.id).lastReport = { text: "found it", at: T0 + 5000, source: "peer" };
+      w.fs.set(REG, JSON.stringify(reg));
+      w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 }));
+    });
+    for (const surface of SURFACES) {
+      for (const cols of [96, 97, 98, 100, 110, 140, 80]) {
+        const ui = await mountPane($, surface, cols);
+        const tree = await ui.drawn();
+        const column = pathTo(tree, `row:${scout.id}`).at(-2);
+        expect(column.props.width ?? cols).toBeGreaterThan(0);
+        const rows = (await ui.findAll({})).filter((n: any) => String(n.props?.key ?? "").startsWith("row:"));
+        expect(rows.length).toBeGreaterThanOrEqual(2);
+        for (const row of rows) {
+          const node = nodeOf(tree, row.props.key);
+          expect(rowWidth(node)).toBeLessThanOrEqual(column.props.width ?? cols);
+        }
+        // the one with the new chip and the cost really is in the check
+        expect(shows(nodeOf(tree, `row:${scout.id}`)).map((x) => x.trim())).toEqual(expect.arrayContaining(["new", "$0.91"]));
+        await ui.unmount();
+      }
+    }
+  });
+
+  test("the header says N live for this chat; the tree footer says how many of the cap's slots every lead's threads use", async ($, on) => {
+    const w = fresh();
+    const base = { requestedModel: "haiku", verifiedModel: "", sessionId: "", tmux: "", cwd: APP, permissionMode: "inherited", task: "t", createdAt: T0 - 600000, lastReport: null, closedAt: 0, backend: "inline", resolvedModel: "" };
+    w.fs.set(`${CFG}/sessions/4100.json`, JSON.stringify({ pid: 4100, sessionId: OTHER_LEAD, cwd: "/x", name: "Other lead", status: "busy" }));
+    w.alive.add(4100);
+    w.fs.set(REG, JSON.stringify({ version: 1, cap: 4, threads: [{ ...base, id: "tother", title: "Thread | Theirs", agentId: "agent-x", status: "working", parent: { sessionId: OTHER_LEAD, title: "Other lead" } }] }));
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- a");
+    await threads($, "new sonnet Sonnet critic -- b");
+    await threads($, "");
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      expect((await ui.find({ type: "Text", text: /^· \d+ live/ }))?.text).toMatch(/^· 2 live · updated /); // this chat's
+      expect(await ui.find({ type: "Text", text: "3 of 4 slots in use" })).toBeDefined(); // everyone's, against the cap
+      expect(await ui.find({ type: "Text", text: /live · cap/ })).toBeUndefined();
+      await ui.unmount();
+    }
+  });
+
+  test("a long path in a 500-character task keeps …/parent/file in the Task row; a padded screen line keeps its filename", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    const long = "/home/tester/.claude/local-marketplaces/claude-mods-computer-use-threads/plugins/threads/hooks/threads.mjs";
+    const task = `Review ${long} for races, then ${"explain every finding at length ".repeat(15)}`.slice(0, 500);
+    await threads($, `new haiku Haiku scout -- ${task}`);
+    const scout = created(w, "Haiku scout");
+    const screenPath = "/home/tester/.claude/local-marketplaces/claude-mods-computer-use-threads/examples/subscription.md";
+    w.tmux.get(scout.tmux)!.screen = `│ Read ${screenPath}${" ".repeat(120)}│`;
+    await threads($, "");
+    for (const surface of SURFACES) {
+      for (const cols of [140, 80]) {
+        const ui = await mountPane($, surface, cols);
+        const row = await ui.find({ type: "Text", text: /^Review / });
+        expect(row?.text).toMatch(/^Review ~\/…\/hooks\/threads\.mjs for races/);
+        expect(row?.text).not.toContain("local-marketplaces");
+        await ui.press({ key: "view" }); // Screen
+        const line = await ui.find({ type: "Text", text: /^│ Read / });
+        expect(line?.text).toMatch(/^│ Read ~\/…\/examples\/subscription\.md/);
+        await ui.press({ key: "view" });
+        await ui.unmount();
+      }
+    }
+  });
+
+  test("the pane shows ~ for the real home only", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- copy /Users/Shared/data/file.txt, GET /Users/42, /home/dashboard and /home/tester/x.ts");
+    await threads($, "");
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      const row = await ui.find({ type: "Text", text: /^copy / });
+      expect(row?.text).toBe("copy /Users/Shared/data/file.txt, GET /Users/42, /home/dashboard and ~/x.ts");
+      await ui.unmount();
+    }
+  });
+
+  test("the thread action is Close thread; the header keeps Close, and the armed notice names the one pressed", async ($, on) => {
+    const { scout } = await paneWorld($, on);
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      await ui.press({ key: `sel:${scout.id}` });
+      const want = (name: string) => (surface === "desktop" ? name : expect.stringMatching(new RegExp(`${name}$`)));
+      expect((await ui.find({ key: "close-thread" }))?.props.label).toEqual(want("Close thread"));
+      expect((await ui.find({ key: "close-pane" }))?.props.label).toEqual(want("Close"));
+      expect((await ui.find({ key: "close-pane" }))?.props.label).not.toMatch(/thread/);
+      expect((await ui.find({ key: "close-thread" }))?.props.hotkey).toBe("x");
+      expect((await ui.find({ key: "close-pane" }))?.props.hotkey).toBe("c");
+      await ui.unmount();
     }
   });
 });
