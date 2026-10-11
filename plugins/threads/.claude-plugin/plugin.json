@@ -1,6 +1,6 @@
 {
   "name": "threads",
-  "version": "0.5.3-local.4",
+  "version": "0.5.3-local.5",
   "description": "A lead chat creates real Claude Code sessions on chosen models, watches them live and steers them.",
   "author": {
     "name": "Prompt Advisers"
