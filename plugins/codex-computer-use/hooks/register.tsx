@@ -63,6 +63,7 @@ How to drive it well:
 - Batch deterministic steps in one call and end it with \`await app.getAXState()\`, which returns a diff of what changed. Re-read indices after every action; never reuse stale ones. Ask for \`{ disableDiffing: true }\` only when you need the full tree.
 - Return only what you need: observation calls print their result by default, so to filter, read with \`{ emit: false }\` (e.g. \`const t = await app.getAXState({ emit: false, disableDiffing: true })\`) and print just the relevant lines with \`nodeRepl.write(...)\`.
 - It works in the background with real clicks, typing and drags, without moving the person's cursor. There is no hover.
+- Keystrokes go to whichever window has focus, and an app with several open documents can move focus between calls (TextEdit after cmd+n can hand focus to another document). Before \`typeText\`, \`paste\` or \`pressKey\`, read the state in the same call (\`await app.getAXState({ emit: false, disableDiffing: true })\`), confirm the focused window is the one you opened or were asked to edit, and stop if it is not. Prefer \`setValue(<element>, text)\` on a text area you identified over typing. Never type into a document that already held content unless the task is to edit that document; if you did, undo it at once and tell the person.
 - After any error or surprise, read the state before retrying: an action can fail yet still apply, and an app dialog may have opened. Answer a dialog that would change the person's settings or data with its least-change option (Not Now, Cancel) unless the task calls for it.
 - When the person wants to watch, bring the app to the front first (\`open -a <App>\` from the shell activates it), then pace the steps with short pauses so each change is visible.
 - Leave apps as you found them (close tabs or windows you opened) unless the task says otherwise.
@@ -70,6 +71,20 @@ How to drive it well:
 - Each app needs approval. If the result says the person is being asked to approve an app, stop and wait for their answer; the mod tells you when they decide. Never try to get around a denial.
 - Other Claude sessions may be using computer use at the same time, each in its own Codex session. An app one of them is driving is leased to it: if the result says an app is in use by another session, work in a different app, or wait about a minute and retry. Never fight over an app.
 - Prefer purpose-built tools first (a CLI, an API, an MCP connector, the built-in browser or Claude in Chrome for web pages). Use Codex computer use for native apps and anything only the GUI can do.`
+
+// Keystrokes land in whichever window has focus, which can move between calls. A call that types
+// before reading the state in that same call acts on a window it has not looked at.
+const WRITE = /\.(typeText|paste|pressKey)\s*\(/
+const READ = /\.(getAXState|getAXStateAndScreenshot|getScreenshot)\s*\(|cua\.(getApp|getState)\s*\(/
+export const typesUnread = (code: unknown) => {
+  const text = typeof code === 'string' ? code : ''
+  const write = text.search(WRITE)
+  if (write < 0) return false
+  const read = text.search(READ)
+  return read < 0 || read > write
+}
+const TYPES_UNREAD =
+  "Refused: this call types or presses keys before reading the app's state. Keystrokes go to whichever window has focus. In this same call, first read the state (`await app.getAXState({ emit: false, disableDiffing: true })`), confirm the focused window is the one you mean to type into, then type."
 
 export const register: Register = on => {
   let isOn = true
@@ -127,6 +142,7 @@ export const register: Register = on => {
     const isReset = tool === BRIDGE_RESET
     isUsedThisTurn = true
     const fail = (text: string) => ({ result: text, text, isError: true as const })
+    if (!isReset && typesUnread((args as { code?: unknown }).code)) return fail(TYPES_UNREAD)
 
     // The daemon, started on first use.
     const dir = `${home}/.claude/mcp/codex-cu`
@@ -339,6 +355,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: CODEX_TOOLS }, async ($, e, next) => {
     isUsedThisTurn = true
+    if (e.tool === CODEX_JS && typesUnread((e as { code?: unknown }).code)) return { deny: TYPES_UNREAD }
     const ran = await next(e)
     // The server's own tool can only ask through the engine's prompt; point at the bridge,
     // which asks through the pane, when that approval did not come through.
