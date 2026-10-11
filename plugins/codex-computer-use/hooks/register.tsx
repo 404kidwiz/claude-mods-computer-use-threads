@@ -316,25 +316,25 @@ export const register: Register = on => {
     const mode = isOn
       ? 'On. Desktop computer use goes through Codex; my own computer-use tools are blocked.'
       : 'Off. I use my own computer-use tools.'
-    const route = `Route: the ${BRIDGE} bridge through the codex-cu daemon (${DAEMON_VERSION}: one Codex session per Claude session, apps leased to one session at a time)${isConnected ? '; the codex-cu server is also connected directly' : ''}.`
+    const route = `Route: the ${BRIDGE} bridge through the codex-cu daemon (${DAEMON_VERSION}: one Codex session per chat, apps leased to one chat at a time)${isConnected ? '; the codex-cu server is also connected directly' : ''}.`
     const standing = await readStanding($, home)
     const always = standing.apps
     const autoLine = standing.autoApproveAll
       ? 'Auto-approve: ON, every app is allowed without asking (/codex-cu auto off to ask again).'
       : 'Auto-approve: off (/codex-cu auto on to allow every app without asking).'
-    const allowedLine = apps.length > 0 ? `Allowed in this chat: ${apps.join(', ')}.` : 'No apps allowed through the pane in this chat yet.'
+    const allowedLine = apps.length > 0 ? `This chat: ${apps.join(', ')} allowed through the pane.` : 'No apps allowed through the pane in this chat yet.'
     const alwaysLine = `Always allowed: ${always.length > 0 ? always.join(', ') : 'none'} (revoke with /codex-cu forget <app>). Apps set to "Always" inside Codex are allowed too.`
 
-    let usersLine = 'Chats using it now: none (the daemon is not running).'
+    let usersLine = 'In use: none (the daemon is not running).'
     try {
       const res = await $.http.fetch('http://codex-cu/sessions', { socketPath: `${home}/.claude/mcp/codex-cu/daemon.sock` })
       const me = await $.session.id()
       const users: { session: string; busy: boolean; leases: string[]; idleSeconds: number }[] = res.ok ? JSON.parse(res.text) : []
       usersLine = users.length === 0
-        ? 'Chats using it now: none.'
-        : `Chats using it now (each with its own Codex session): ${users
+        ? 'In use: none.'
+        : `In use: ${users
             .map(u => `${u.session.startsWith(me) ? 'this chat' : u.session.slice(0, 8)}${u.session.includes('/') ? ' (subagent)' : ''}${u.busy ? ' working' : ` idle ${u.idleSeconds}s`}${u.leases.length > 0 ? `, holds ${u.leases.join(', ')}` : ''}`)
-            .join('; ')}.`
+            .join('; ')} (each chat has its own Codex session).`
     } catch {
       // daemon not running
     }

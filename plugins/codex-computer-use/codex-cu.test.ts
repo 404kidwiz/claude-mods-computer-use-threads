@@ -49,6 +49,7 @@ test('daemon route: an unapproved app opens the approval pane; allowed apps are 
   engine(on)
   const bodies: string[] = []
   const opened: string[] = []
+  const rows: unknown[] = []
   let declined = '["Calculator"]'
   on('mcp.call', () => ({ deny: 'not connected in this session' }))
   on('http.fetch', ($, e) => {
@@ -58,6 +59,7 @@ test('daemon route: an unapproved app opens the approval pane; allowed apps are 
   })
   on('ui.open', ($, e) => {
     opened.push(e.id)
+    rows.push((e as { rows?: unknown }).rows)
     return { value: { isPlaced: true } }
   })
   await $.session.start(start)
@@ -66,6 +68,8 @@ test('daemon route: an unapproved app opens the approval pane; allowed apps are 
   expect(first.isError).toBe(true)
   expect(String(first.text)).toContain('approval to use Calculator')
   expect(opened).toEqual(['codex-approval'])
+  // room for the heading, a wrapped dim line and a wrapped button row in a narrow pane
+  expect(rows).toEqual([10])
   expect(JSON.parse(bodies[0]).approve).toEqual([])
   expect(JSON.parse(bodies[0]).session).toBe('sess-1')
   expect(JSON.parse(bodies[0]).code).toContain('Calculator')
@@ -145,7 +149,7 @@ test('session end frees its Codex sessions; status lists who holds which app', a
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   await $.session.start(start)
   const status = await $.command.run({ command: 'codex-cu', args: 'status', origin: { kind: 'composer' } } as any)
-  expect(String(status.text)).toContain('Chats using it now (each with its own Codex session): this chat idle 3s, holds TextEdit; abcdef12 working, holds Calculator.')
+  expect(String(status.text)).toContain('In use: this chat idle 3s, holds TextEdit; abcdef12 working, holds Calculator (each chat has its own Codex session).')
   await $.session.end({ reason: 'exit', sessionId: 'sess-1', resume: {} } as any)
   expect(calls.at(-1)).toEqual({ url: 'http://codex-cu/end', body: { session: 'sess-1' } })
 })
