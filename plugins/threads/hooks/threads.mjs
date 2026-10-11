@@ -99,6 +99,13 @@ import {
   worktreeFor,
   worktreeOutcome,
   isUnread,
+  keyLabel,
+  paneMoney,
+  paneTime,
+  plainTail,
+  plainText,
+  tidyPath,
+  tidyPaths,
 } from "./core.mjs";
 
 const PANE = "threads";
@@ -548,6 +555,21 @@ export function register(on, options) {
     const leftW = isWide ? Math.min(44, Math.floor(width * 0.36)) : width;
     const rightW = isWide ? width - leftW - 2 : width;
     const dim = (s, w) => Text({ dimColor: true, wrap: "truncate", children: clip(s, w) });
+    const isDesktop = e.surface !== "terminal";
+    // the desktop badges each Button's hotkey itself and the terminal draws a bare `[ label ]`, so only there the letter leads the label
+    const btn = (key, text, hotkey, onPress, extra) => Button({ key, label: keyLabel(text, hotkey, isDesktop), hotkey, onPress, ...extra });
+    // a dim label column and a truncating value: padding a label with spaces draws in another font on the desktop
+    const LABEL_W = 8;
+    const valueW = rightW - LABEL_W - 1;
+    const field = (label, value, color) =>
+      Box({
+        flexDirection: "row",
+        gap: 1,
+        children: [
+          Box({ width: LABEL_W, flexShrink: 0, children: [Text({ dimColor: true, children: label })] }),
+          Text({ color, wrap: "truncate", children: clip(value, valueW) }),
+        ],
+      });
 
     const visible = view.threads.filter((t) => ui.showArchived || !t.archived);
     const archivedCount = view.threads.filter((t) => t.archived).length;
@@ -556,13 +578,20 @@ export function register(on, options) {
     const others = visible.filter((t) => !t.isMine).sort(pinFirst);
     const shown = [...mine, ...(ui.showOthers ? others : [])];
     const selected = shown.find((t) => t.id === ui.selected) ?? shown[0] ?? null;
-    const isDesktop = e.surface !== "terminal";
 
     // left: the tree
     const tree = [
       Text({ bold: true, wrap: "truncate", children: clip(`Lead · ${view.leadTitle || "this chat"}`, leftW) }),
     ];
-    if (mine.length === 0) tree.push(dim("  no threads yet: /threads new", leftW));
+    const titleOf = (t) => `${t.pinned ? "⚑ " : ""}${t.forkedFrom ? "⑂ " : ""}${t.worktree && !t.worktree.removed ? "⎇ " : ""}${t.desktop?.length ? "▣ " : ""}${shortTitle(t.title)}${t.archived ? " (archived)" : ""}`;
+    const chipOf = (t) => modelChip(t.verifiedModel || t.requestedModel);
+    // columns are sized to the rows on show so the model, new chip and cost line up; the title takes what is left
+    const chipW = Math.max(0, ...shown.map((t) => chipOf(t).length));
+    const costW = Math.max(0, ...shown.map((t) => (t.costUsd ? paneMoney(t.costUsd).length : 0)));
+    const hasNew = shown.some(isUnread);
+    // marker (3), dot (1), three gaps, then the model, "new" and cost columns
+    const rowFixed = 3 + 1 + 3 + chipW + (hasNew ? 4 : 0) + (costW ? 1 + costW : 0);
+    const titleW = Math.max(12, Math.min(leftW - rowFixed, Math.max(0, ...shown.map((t) => titleOf(t).length + 3))));
     const row = (t, i, indent) => {
       const hotkey = i < 9 ? String(i + 1) : undefined;
       const isSel = selected && t.id === selected.id;
@@ -573,17 +602,23 @@ export function register(on, options) {
         children: [
           Text({ children: `${indent}${isSel ? "›" : " "}` }),
           Text({ color: colorOf(t.status), children: dotOf(t.status) }),
-          Text({ color: "blue", children: modelChip(t.verifiedModel || t.requestedModel).padEnd(6) }),
-          Button({
-            key: `sel:${t.id}`,
-            label: clip(`${t.pinned ? "⚑ " : ""}${t.forkedFrom ? "⑂ " : ""}${t.worktree && !t.worktree.removed ? "⎇ " : ""}${t.desktop?.length ? "▣ " : ""}${shortTitle(t.title)}${t.archived ? " (archived)" : ""}`, Math.max(8, leftW - 24 - indent.length - (isUnread(t) ? 4 : 0))),
-            hotkey,
-            plain: true,
-            dimColor: !isSel,
-            onPress: () => selectThread($, t.id),
+          Box({
+            width: titleW,
+            flexShrink: 0,
+            children: [
+              Button({
+                key: `sel:${t.id}`,
+                label: clip(titleOf(t), titleW - 3),
+                hotkey,
+                plain: true,
+                dimColor: !isSel,
+                onPress: () => selectThread($, t.id),
+              }),
+            ],
           }),
+          Box({ width: chipW, flexShrink: 0, children: [Text({ dimColor: true, children: chipOf(t) })] }),
           ...(isUnread(t) ? [Text({ color: "yellow", bold: true, children: "new" })] : []),
-          ...(t.costUsd ? [Text({ dimColor: true, children: money(t.costUsd) })] : []),
+          ...(t.costUsd ? [Text({ dimColor: true, children: paneMoney(t.costUsd) })] : []),
         ],
       });
     };
@@ -612,7 +647,7 @@ export function register(on, options) {
       }
     }
     const totalCost = mine.reduce((a, t) => a + (t.costUsd ?? 0), 0);
-    tree.push(dim(`${view.threads.filter((t) => LIVE.has(t.status)).length} live · cap ${view.cap}${totalCost ? ` · ${money(totalCost)} est.` : ""}`, leftW));
+    tree.push(dim(`${view.threads.filter((t) => LIVE.has(t.status)).length} live · cap ${view.cap}${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""}`, leftW));
     if (archivedCount) {
       tree.push(
         Button({
@@ -637,7 +672,7 @@ export function register(on, options) {
       const planCost = plan.phases.reduce((a, ph) => a + (byId.get(ph.threadId)?.costUsd ?? 0), 0);
       const isHistory = plan.status !== "running";
       right.push(Text({ bold: true, wrap: "truncate", children: clip(`Plan ${plan.title} (${plan.id}) · ${plan.status} · gate ${plan.gate}${isHistory ? " · history (read-only)" : ""}`, rightW) }));
-      right.push(dim(`est. API-equivalent ${money(planCost)} · ${plan.phases.length} phases`, rightW));
+      right.push(dim(`est. API-equivalent ${paneMoney(planCost)} · ${plan.phases.length} phases`, rightW));
       if (plans.length > 1) {
         right.push(
           Box({
@@ -650,7 +685,7 @@ export function register(on, options) {
           }),
         );
       }
-      right.push(dim(`handoffs in ${shortPath(plan.handoffDir, rightW - 12)}`, rightW));
+      right.push(dim(`handoffs in ${tidyPath(plan.handoffDir, rightW - 12)}`, rightW));
       plan.phases.forEach((ph, i) => {
         const th = byId.get(ph.threadId);
         right.push(
@@ -660,11 +695,11 @@ export function register(on, options) {
             children: [
               Text({ color: color[ph.status], children: `${phaseNumber(i)} ${ph.status.padEnd(13)}` }),
               Text({ color: "blue", children: `${ph.model}${ph.effort ? `/${ph.effort}` : ""}` }),
-              Text({ wrap: "truncate", children: clip(`${ph.name}${th ? ` · ${th.id} ${th.status}` : ""}${th?.costUsd ? ` · ${money(th.costUsd)}` : ""}${(ph.gate ?? plan.gate) !== "auto" && i < plan.phases.length - 1 ? ` · gate ${ph.gate ?? plan.gate}` : ""}`, Math.max(10, rightW - 34)) }),
+              Text({ wrap: "truncate", children: clip(`${ph.name}${th ? ` · ${th.id} ${th.status}` : ""}${th?.costUsd ? ` · ${paneMoney(th.costUsd)}` : ""}${(ph.gate ?? plan.gate) !== "auto" && i < plan.phases.length - 1 ? ` · gate ${ph.gate ?? plan.gate}` : ""}`, Math.max(10, rightW - 34)) }),
             ],
           }),
         );
-        if (ph.handoffPath) right.push(dim(`   handoff ${shortPath(ph.handoffPath, rightW - 11)}`, rightW));
+        if (ph.handoffPath) right.push(dim(`   handoff ${tidyPath(ph.handoffPath, rightW - 11)}`, rightW));
         if (ph.note) right.push(dim(`   ${ph.note}`, rightW));
       });
       const chain = plan.phases.map((ph) => ph.threadId || "·").join(" → ");
@@ -673,13 +708,27 @@ export function register(on, options) {
         right.push(Text({ color: "magenta", children: "Phase ready: run /threads plan next" }));
       }
     } else if (!selected) {
-      right.push(dim("Create one with /threads new haiku Scout -- list the files here", rightW));
-      right.push(dim("or ask in plain English: spin up a Haiku thread to ...", rightW));
+      // nothing yet: an invitation to start one
+      right.push(Text({ bold: true, children: "Start a thread" }));
+      right.push(Text({ dimColor: true, wrap: "wrap", children: "Ask in the chat (spin up a Haiku thread to …) or run /threads new haiku Scout -- <task>" }));
     } else {
       const t = selected;
+      const isInline = t.backend === "inline";
+      const isLive = LIVE.has(t.status);
+      // a session thread stuck on a permission question: answering it is the main action, steering moves to More
+      const needsDecision = t.status === "needs-you" && !isInline;
       const verified = t.verifiedModel ? t.verifiedModel : "not seen yet";
-      right.push(Text({ bold: true, wrap: "truncate", children: clip(`${t.title}  (${t.id})`, rightW) }));
-      right.push(
+
+      // who it is and what it is doing
+      const info = [];
+      info.push(
+        Box({
+          flexDirection: "row",
+          gap: 1,
+          children: [Text({ bold: true, wrap: "truncate", children: clip(shortTitle(t.title), Math.max(8, rightW - t.id.length - 1)) }), Text({ dimColor: true, children: t.id })],
+        }),
+      );
+      info.push(
         Box({
           flexDirection: "row",
           gap: 1,
@@ -689,76 +738,88 @@ export function register(on, options) {
           ],
         }),
       );
-      right.push(dim(`model  asked ${t.requestedModel} · running ${verified}${t.effort ? ` · effort ${t.effort}` : ""}`, rightW));
-      const isInline = t.backend === "inline";
-      right.push(dim(`cwd    ${shortPath(t.cwd, isInline ? 40 : rightW - 7)}${isInline ? ` · inline agent ${t.agentId}` : ""}`, rightW));
-      right.push(dim(`task   ${oneLine(t.task)}`, rightW));
-      right.push(dim(`cost   ${t.costUsd ? money(t.costUsd) : "$0"} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`, rightW));
-      if (t.forkedFrom) right.push(dim(`${t.handedOff ? "handoff" : "fork  "} from "${t.forkedFrom.title}" with ${t.forkedFrom.include === "full" ? "its transcript" : "a summary"}`, rightW));
-      if (t.desktop?.length) right.push(dim(`desk   drives ${t.desktop.join(", ")} through Codex computer use (leased to this thread)`, rightW));
+      info.push(field("Model", `asked ${t.requestedModel} · running ${verified}${t.effort ? ` · effort ${t.effort}` : ""}`));
+      info.push(field("Folder", `${tidyPath(t.cwd, isInline ? 40 : valueW)}${isInline ? ` · inline agent ${t.agentId}` : ""}`));
+      info.push(field("Task", tidyPaths(oneLine(t.task), valueW)));
+      info.push(field("Cost", `${paneMoney(t.costUsd)} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
+      if (t.lastReport?.text) info.push(field("Report", tidyPaths(oneLine(plainText(t.lastReport.text)), valueW), "cyan"));
+      if (t.forkedFrom) info.push(field(t.handedOff ? "Handoff" : "Forked", `from "${t.forkedFrom.title}" with ${t.forkedFrom.include === "full" ? "its transcript" : "a summary"}`));
+      if (t.desktop?.length) info.push(field("Desk", `drives ${t.desktop.join(", ")} through Codex computer use (leased to this thread)`));
       if (t.worktree) {
         const w = t.worktree;
         const state = w.removed ? "removed (no changes)" : w.kept ? `kept${w.commits ? `, ${w.commits} commit${w.commits === 1 ? "" : "s"}` : ""}${w.dirty ? ", uncommitted changes" : ""} · merge: git merge ${w.branch}` : "isolated";
-        right.push(dim(`tree   ${w.branch} · ${state}`, rightW));
-      }
-      if (t.lastReport?.text) {
-        right.push(Text({ color: "cyan", wrap: "truncate", children: clip(`report ${t.lastReport.text}`, rightW) }));
+        info.push(field("Worktree", `${w.branch} · ${state}`));
       }
       if (t.status === "needs-you" && t.prompt && isInline) {
-        right.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
+        info.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
       } else if (t.status === "needs-you" && t.prompt) {
-        right.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
+        info.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
       }
-      if (t.status === "needs-login") right.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
+      if (t.status === "needs-login") info.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
       if (t.status === "needs-trust") {
-        right.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
+        info.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
       }
-      const isLive = LIVE.has(t.status);
-      const buttons = [
-        Button({ key: "view", label: `w ${ui.mode === "screen" ? "Transcript" : isInline ? "Activity" : "Screen"}`, hotkey: "w", onPress: () => toggleMode($) }),
-      ];
-      if (isLive) {
-        buttons.push(
-          Button({ key: "steer", label: "s Steer", hotkey: "s", variant: "primary", onPress: () => patchUi($, (u) => ({ ...u, steering: !u.steering })) }),
-          Button({ key: "interrupt", label: isInline ? "i Stop" : "i Interrupt", hotkey: "i", onPress: () => noticeOf($, () => interruptThread($, t)) }),
-        );
-        // model and effort open a row of choices right here (no dialog, so they work on every surface)
-        if (!isInline) buttons.push(Button({ key: "model", label: "m Model", hotkey: "m", onPress: () => patchUi($, (u) => ({ ...u, picker: u.picker === "model" ? "" : "model" })) }));
-        buttons.push(Button({ key: "effort", label: "e Effort", hotkey: "e", onPress: () => patchUi($, (u) => ({ ...u, picker: u.picker === "effort" ? "" : "effort" })) }));
-      }
-      if (t.status === "needs-you" && !isInline) {
-        buttons.push(
-          Button({ key: "approve", label: "y Approve", hotkey: "y", onPress: () => noticeOf($, () => answerPrompt($, t, true)) }),
-          Button({ key: "deny", label: "n Deny", hotkey: "n", onPress: () => noticeOf($, () => answerPrompt($, t, false)) }),
-        );
-      }
-      buttons.push(
-        Button({ key: "open", label: "o Open", hotkey: "o", onPress: (pe) => noticeOf($, () => openThread($, t, pe?.surface)) }),
+
+      // what you can do: the main actions first (Approve is the one primary button), Close set apart at the end
+      const actions = [];
+      const steer = btn("steer", "Steer", "s", () => patchUi($, (u) => ({ ...u, steering: !u.steering })));
+      const interrupt = btn("interrupt", isInline ? "Stop" : "Interrupt", "i", () => noticeOf($, () => interruptThread($, t)));
+      const primary = needsDecision
+        ? [
+            btn("approve", "Approve", "y", () => noticeOf($, () => answerPrompt($, t, true)), { variant: "primary" }),
+            btn("deny", "Deny", "n", () => noticeOf($, () => answerPrompt($, t, false))),
+          ]
+        : isLive
+          ? [steer, interrupt]
+          : [];
+      primary.push(btn("open", "Open", "o", (pe) => noticeOf($, () => openThread($, t, pe?.surface))));
+      // a hotkey is one digit or lowercase letter, so More takes d: m, o and e are Model, Open and Effort's. Collapsing it closes its picker.
+      primary.push(btn("more", ui.more ? "Less" : "More", "d", () => patchUi($, (u) => ({ ...u, more: !u.more, picker: u.more ? "" : u.picker }))));
+      actions.push(
+        Box({
+          flexDirection: "row",
+          flexWrap: "wrap",
+          justifyContent: "space-between",
+          gap: 1,
+          children: [
+            Box({ flexDirection: "row", flexWrap: "wrap", gap: 1, children: primary }),
+            ...(t.status !== "closed" ? [btn("close-thread", "Close", "x", () => noticeOf($, () => closeThread($, t, { from: "pane" })))] : []),
+          ],
+        }),
       );
-      buttons.push(
-        Button({ key: "pin", label: t.pinned ? "u Unpin" : "u Pin", hotkey: "u", onPress: () => noticeOf($, () => setFlag($, t, "pinned", !t.pinned)) }),
-        Button({ key: "archive", label: t.archived ? "v Unarchive" : "v Archive", hotkey: "v", onPress: () => noticeOf($, () => setFlag($, t, "archived", !t.archived)) }),
-        Button({ key: "rename", label: "t Rename", hotkey: "t", onPress: () => patchUi($, (u) => ({ ...u, renaming: !u.renaming, steering: false })) }),
-      );
-      if (t.status !== "closed") {
-        buttons.push(Button({ key: "close-thread", label: "x Close", hotkey: "x", onPress: () => noticeOf($, () => closeThread($, t, { from: "pane" })) }));
-      }
-      right.push(Box({ flexDirection: "row", flexWrap: "wrap", gap: 1, children: buttons }));
-      if (ui.picker && isLive) {
-        const choices = ui.picker === "model" ? MODEL_ALIASES : EFFORTS;
-        const current = ui.picker === "model" ? t.requestedModel : t.effort;
-        right.push(
+      if (ui.more) {
+        actions.push(
           Box({
             flexDirection: "row",
             flexWrap: "wrap",
             gap: 1,
             children: [
-              Text({ dimColor: true, children: ui.picker === "model" ? "model:" : "effort:" }),
+              ...(needsDecision ? [steer, interrupt] : []),
+              // model and effort open a row of choices right here (no dialog, so they work on every surface)
+              ...(isLive && !isInline ? [btn("model", "Model", "m", () => patchUi($, (u) => ({ ...u, picker: u.picker === "model" ? "" : "model" })))] : []),
+              ...(isLive ? [btn("effort", "Effort", "e", () => patchUi($, (u) => ({ ...u, picker: u.picker === "effort" ? "" : "effort" })))] : []),
+              btn("pin", t.pinned ? "Unpin" : "Pin", "u", () => noticeOf($, () => setFlag($, t, "pinned", !t.pinned))),
+              btn("archive", t.archived ? "Unarchive" : "Archive", "v", () => noticeOf($, () => setFlag($, t, "archived", !t.archived))),
+              btn("rename", "Rename", "t", () => patchUi($, (u) => ({ ...u, renaming: !u.renaming, steering: false }))),
+            ],
+          }),
+        );
+      }
+      if (ui.picker && isLive) {
+        const choices = ui.picker === "model" ? MODEL_ALIASES : EFFORTS;
+        const current = ui.picker === "model" ? t.requestedModel : t.effort;
+        actions.push(
+          Box({
+            flexDirection: "row",
+            flexWrap: "wrap",
+            gap: 1,
+            children: [
+              Text({ dimColor: true, children: ui.picker === "model" ? "Model" : "Effort" }),
+              // the tick marks the current choice; Approve stays the pane's only primary button
               ...choices.map((c) =>
                 Button({
                   key: `pick:${ui.picker}:${c}`,
                   label: c === current ? `${c} ✓` : c,
-                  variant: c === current ? "primary" : undefined,
                   onPress: () =>
                     noticeOf($, async () => {
                       const kind = ui.picker;
@@ -772,9 +833,9 @@ export function register(on, options) {
           }),
         );
       }
-      if (ui.armedClose?.id === t.id) right.push(Text({ color: "magenta", wrap: "truncate", children: clip("Press Close again within 10 seconds to close it.", rightW) }));
+      if (ui.armedClose?.id === t.id) actions.push(Text({ color: "magenta", wrap: "truncate", children: clip("Press Close again within 10 seconds to close it.", rightW) }));
       if (ui.renaming && Input) {
-        right.push(
+        actions.push(
           Input({
             key: "rename-input",
             label: "New name › ",
@@ -791,46 +852,93 @@ export function register(on, options) {
       }
       if (ui.steering && isLive) {
         if (Input) {
-          right.push(
+          actions.push(
             Input({
               key: "steer-input",
               label: "Message › ",
-              placeholder: "tell the thread what to change, Enter sends",
+              placeholder: "Tell the thread what to change, Enter sends",
               submitLabel: "send",
               autoFocus: true,
               onSubmit: (value) => noticeOf($, () => steerFromPane($, t, value)),
             }),
           );
         } else {
-          right.push(dim(`Use /threads send ${t.id} <message> to steer it.`, rightW));
+          actions.push(dim(`Use /threads send ${t.id} <message> to steer it.`, rightW));
         }
       }
       for (const line of String(ui.notice ?? "").split("\n").filter(Boolean).slice(0, 4)) {
-        right.push(Text({ color: "green", wrap: "truncate", children: clip(line, rightW) }));
+        actions.push(Text({ color: "green", wrap: "truncate", children: clip(line, rightW) }));
       }
+
+      // what it has been doing, with the Screen / Transcript switch beside the heading
+      const feed = [];
       const isFresh = detail.id === t.id && detail.mode === ui.mode;
-      const heading = ui.mode === "screen" ? (isInline ? "Live activity (last 30)" : "Screen (last 30 lines)") : "Transcript (last 20)";
-      right.push(Text({ bold: true, children: heading }));
-      if (!isFresh) right.push(dim("loading…", rightW));
+      const isScreen = ui.mode === "screen";
+      // a session's screen is a raw terminal capture and is shown as it is (paths tidied); everything else is cleaned of markdown
+      const isRaw = isScreen && !isInline;
+      feed.push(
+        Box({
+          flexDirection: "row",
+          justifyContent: "space-between",
+          gap: 1,
+          children: [
+            Box({
+              flexDirection: "row",
+              gap: 1,
+              children: [Text({ bold: true, children: isScreen ? (isInline ? "Activity" : "Screen") : "Transcript" }), Text({ dimColor: true, children: `last ${isScreen ? 30 : 20}` })],
+            }),
+            btn("view", isScreen ? "Transcript" : isInline ? "Activity" : "Screen", "w", () => toggleMode($)),
+          ],
+        }),
+      );
+      if (!isFresh) feed.push(dim("Loading…", rightW));
       else if (detail.lines.length === 0) {
-        right.push(dim(ui.mode === "screen" ? (isInline ? "(no activity seen yet)" : "(screen is empty or the thread is gone)") : "(nothing in the transcript yet)", rightW));
+        feed.push(dim(isScreen ? (isInline ? "No activity seen yet" : "The screen is empty or the thread is gone") : "Nothing in the transcript yet", rightW));
       }
-      else for (const l of detail.lines) right.push(Text({ wrap: "truncate", dimColor: ui.mode === "screen", children: clip(l, rightW) }));
+      else if (isRaw) for (const l of detail.lines) feed.push(Text({ wrap: "truncate", dimColor: true, children: clip(tidyPaths(l, rightW), rightW) }));
+      else {
+        // items are "[HH:MM:SS ]tag  text": dim clock and tag columns instead of space padding, which draws in another font on the desktop
+        for (const l of detail.lines) {
+          const m = /^(?:(\d\d:\d\d:\d\d) )?(\S+)\s+([\s\S]*)$/.exec(String(l ?? ""));
+          const textW = rightW - 6 - (m?.[1] ? 9 : 0);
+          const cols = m?.[1] ? [Box({ width: 8, flexShrink: 0, children: [Text({ dimColor: true, children: m[1] })] })] : [];
+          cols.push(
+            Box({ width: 5, flexShrink: 0, children: [Text({ dimColor: true, children: m ? m[2] : "" })] }),
+            Text({ wrap: "truncate", dimColor: isScreen, children: clip(tidyPaths(plainText(m ? m[3] : l), textW), textW) }),
+          );
+          feed.push(Box({ flexDirection: "row", gap: 1, children: cols }));
+        }
+      }
+
+      right.push(
+        Box({ flexDirection: "column", children: info }),
+        Box({ flexDirection: "column", marginTop: 1, children: actions }),
+        Box({ flexDirection: "column", marginTop: 1, children: feed }),
+      );
     }
 
+    const liveCount = mine.filter((t) => LIVE.has(t.status)).length;
+    const stamp = paneTime(view.refreshedAt);
+    const meta = `· ${liveCount} live${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""} · ${stamp ? `updated ${stamp}` : "not refreshed yet"}`;
+    // the title and its dim facts on the left, the pane's controls right-aligned (they wrap under it when the pane is narrow)
+    const headSpecs = [
+      ["refresh", "Refresh", "r", () => refresh($, { force: true })],
+      ...((view.plans ?? []).length ? [["plan-view", ui.planView ? "Threads" : "Plan", "p", () => patchUi($, (u) => ({ ...u, planView: !u.planView }))]] : []),
+      // a desktop draws a dismiss Button as its own close control at the pane's edge
+      ["close-pane", "Close", "c", () => $.ui.close({ id: PANE }), { role: "dismiss" }],
+    ];
+    const buttonsW = headSpecs.reduce((a, s) => a + keyLabel(s[1], s[2], isDesktop).length + 5, 0);
     const head = Box({
       flexDirection: "row",
+      flexWrap: "wrap",
+      justifyContent: "space-between",
       gap: 1,
       children: [
-        dim(`Threads · ${mine.length} yours${others.length ? ` · ${others.length} other` : ""} · ${clockOf(view.refreshedAt)}`, Math.max(20, width - 26)),
-        Button({ key: "refresh", label: "r Refresh", hotkey: "r", onPress: () => refresh($, { force: true }) }),
-        ...((view.plans ?? []).length
-          ? [Button({ key: "plan-view", label: ui.planView ? "p Threads" : "p Plan", hotkey: "p", onPress: () => patchUi($, (u) => ({ ...u, planView: !u.planView })) })]
-          : []),
-        Button({ key: "close-pane", label: "c Close", hotkey: "c", role: "dismiss", onPress: () => $.ui.close({ id: PANE }) }),
+        Box({ flexDirection: "row", gap: 1, children: [Text({ bold: true, children: "Threads" }), dim(meta, Math.max(10, width - 8 - buttonsW))] }),
+        Box({ flexDirection: "row", gap: 1, children: headSpecs.map((s) => btn(...s)) }),
       ],
     });
-    // how to use the pane: clicking works everywhere; keys need the pane to hold the keyboard
+    // how to use the pane, only until there is a thread to look at: clicking works everywhere; keys need the pane to hold the keyboard
     const hint = Text({
       dimColor: true,
       wrap: "wrap",
@@ -838,17 +946,23 @@ export function register(on, options) {
         ? "Click a thread or any button. You can also ask in the chat: show, steer, fork, wait for or close threads."
         : "Click a thread or any button. Keys: ctrl+x then tab gives the pane the keyboard; the letter on each button is its key.",
     });
+    // one blank row between the sections
     const body = isWide
       ? Box({
           flexDirection: "row",
           gap: 2,
+          marginTop: 1,
           children: [
             Box({ flexDirection: "column", width: leftW, children: tree }),
             Box({ flexDirection: "column", width: rightW, children: right }),
           ],
         })
-      : Box({ flexDirection: "column", children: [...tree, Text({ children: " " }), ...right] });
-    return Box({ flexDirection: "column", children: [head, hint, body] });
+      : Box({
+          flexDirection: "column",
+          marginTop: 1,
+          children: [Box({ flexDirection: "column", children: tree }), Box({ flexDirection: "column", marginTop: 1, children: right })],
+        });
+    return Box({ flexDirection: "column", children: [head, ...(mine.length === 0 ? [hint] : []), body] });
   });
 }
 
@@ -3773,12 +3887,5 @@ function fitTail(head, body, max) {
   }
   const dropped = body.length - kept.length;
   return [...head, ...(dropped ? [`(${dropped} older line${dropped === 1 ? "" : "s"} left out)`] : []), ...kept].join("\n");
-}
-
-function clockOf(ms) {
-  if (!ms) return "not refreshed yet";
-  const d = new Date(ms);
-  const two = (n) => String(n).padStart(2, "0");
-  return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
 }
 

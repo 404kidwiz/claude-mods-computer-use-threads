@@ -304,8 +304,8 @@ const TRUST = /Do you trust the files in this folder|Yes, I trust this folder|Is
 const YES_OPTION = /^\s*[❯>›]?\s*1\.\s+Yes\b/m;
 
 const HELD = /Held message from another session/;
-// the codex-computer-use mod's approval pane: "Allow Codex computer use to use <App>?"
-const CU_ASK = /Allow Codex computer use to use (.+?)\?/;
+// the codex-computer-use mod's approval pane: "Allow Codex to use <App>?" (older versions: "Allow Codex computer use to use <App>?")
+const CU_ASK = /Allow Codex (?:computer use )?to use (.+?)\?/;
 const BYPASS_WARNING = /WARNING: Claude Code running in Bypass Permissions mode|you accept all responsibility for actions taken while running in Bypass Permissions mode/i;
 
 export function readScreen(text) {
@@ -1328,4 +1328,98 @@ export function forkPrompt(outline) {
     "An outline of the whole conversation, oldest first, to make sure nothing early is missed:",
     outline || "(no outline)",
   ].join("\n");
+}
+
+// ---- pane-only formatting ----------------------------------------------------------------------
+//
+// money(), localTime() and shortPath() feed model-facing text and records, so the pane's tidier
+// forms live beside them instead of changing them.
+
+// A button label for the surface it is drawn on. The terminal draws a bare `[ label ]` with no hotkey
+// badge, so the letter leads the label there; a desktop badges the hotkey itself, and showing the
+// letter too would print it twice.
+export function keyLabel(text, hotkey, isDesktop) {
+  return isDesktop || !hotkey ? text : `${hotkey} ${text}`;
+}
+
+// Pane money: whole cents, "<$0.01" for a trace, "$0" for nothing (the sub-cent digits of money() are noise here).
+export function paneMoney(usd) {
+  const n = Number(usd);
+  if (!(n > 0)) return "$0";
+  if (n < 0.01) return "<$0.01";
+  return `$${n.toFixed(2)}`;
+}
+
+// Pane time of day, HH:MM in local time: a glance wants no seconds.
+export function paneTime(ms) {
+  if (!ms) return "";
+  const d = new Date(ms);
+  return `${two(d.getHours())}:${two(d.getMinutes())}`;
+}
+
+const HOME_PREFIX = /^(?:\/Users\/[^/]+|\/home\/[^/]+)(?=\/|$)/;
+// A path-looking word: it starts the text or follows a space or an opening mark, and begins with / or ~/ (so a URL's // never matches).
+const PATH_WORD = /(^|[\s"'`(=,[])(~?\/[^\s"'`)\],;|]+)/g;
+
+export function homePath(path) {
+  return String(path ?? "").replace(HOME_PREFIX, "~");
+}
+
+// A path at most `max` cells wide: home as ~, and when that is still too long the middle goes but the last
+// two segments stay (`~/…/hooks/threads.mjs`), keeping as much of the head as fits. Too short even for that: its tail.
+export function tidyPath(path, max) {
+  const p = homePath(path);
+  if (p.length <= max) return p;
+  const parts = p.split("/");
+  if (parts.length > 3) {
+    const tail = parts.slice(-2).join("/");
+    for (let keep = parts.length - 3; keep >= 1; keep--) {
+      const t = `${parts.slice(0, keep).join("/")}/…/${tail}`;
+      if (t.length <= max) return t;
+    }
+  }
+  return `…${p.slice(p.length - Math.max(0, max - 1))}`;
+}
+
+// A line of text with home shown as ~ in every path in it and, when the line is wider than `width`, the
+// longest paths shortened (each keeps its last two segments) so that it fits. When even that would not
+// fit, the paths stay whole: the caller clips the line and a shortened path would only lose detail early.
+export function tidyPaths(text, width = Infinity) {
+  const out = String(text ?? "").replace(PATH_WORD, (_, lead, p) => lead + homePath(p));
+  if (out.length <= width) return out;
+  const words = [...out.matchAll(PATH_WORD)]
+    .map((m) => ({ at: m.index + m[1].length, text: m[2] }))
+    .filter((w) => w.text.split("/").length > 3)
+    .sort((a, b) => b.text.length - a.text.length);
+  let excess = out.length - width;
+  const cuts = [];
+  for (const w of words) {
+    if (excess <= 0) break;
+    const parts = w.text.split("/");
+    const floor = `${parts[0]}/…/${parts.slice(-2).join("/")}`.length;
+    const short = tidyPath(w.text, Math.max(floor, w.text.length - excess));
+    if (short.length < w.text.length) {
+      cuts.push({ ...w, short });
+      excess -= w.text.length - short.length;
+    }
+  }
+  if (excess > 0) return out;
+  let result = out;
+  for (const c of cuts.sort((a, b) => b.at - a.at)) result = result.slice(0, c.at) + c.short + result.slice(c.at + c.text.length);
+  return result;
+}
+
+// Markdown out of a model's words, for a pane that draws plain text: `**`/`__` emphasis, backticks, leading #
+// headings and [text](url) links (a code span is left alone, so `__init__` keeps its underscores).
+export function plainText(s) {
+  return String(s ?? "")
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "")
+    .replace(/`([^`\n]+)`|\[([^\]\n]+)\]\([^)\s]*\)|(\*\*|__)(\S(?:[^\n]*?\S)?)\3/g, (_, code, link, _mark, strong) => code ?? link ?? strong)
+    .replace(/`/g, "");
+}
+
+// plainText for a transcript line, which leads with a tag column ("says  ## Done"): the tag stays, the words are cleaned.
+export function plainTail(line) {
+  const m = /^(\S+\s+)([\s\S]*)$/.exec(String(line ?? ""));
+  return m ? m[1] + plainText(m[2]) : plainText(line);
 }

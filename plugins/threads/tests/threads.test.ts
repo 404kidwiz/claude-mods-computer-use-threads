@@ -26,6 +26,13 @@ import {
   buildSpawnArgv,
   worktreeOutcome,
   isUnread,
+  keyLabel,
+  paneMoney,
+  paneTime,
+  plainTail,
+  plainText,
+  tidyPath,
+  tidyPaths,
 } from "../hooks/core.mjs";
 
 const HOME = "/home/tester";
@@ -979,13 +986,19 @@ describe("threads: pane and band", () => {
       expect(await ui.find({ key: "others", text: /Show other leads' threads \(1\)/ })).toBeDefined();
       // the first of yours is selected: Haiku scout (created first, sorted newest first => critic first)
       await ui.press({ key: `sel:${scout.id}` });
-      expect(await ui.find({ type: "Text", text: `Thread | Haiku scout  (${scout.id})` })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /model  asked haiku · running claude-haiku-4-5-20251001/ })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /task   list the files here/ })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /says  README\.md, notes\.txt/ })).toBeDefined();
-      for (const key of ["view", "steer", "interrupt", "model", "open", "close-thread", "refresh", "close-pane"]) {
+      expect(await ui.find({ type: "Text", text: "Haiku scout" })).toBeDefined(); // the name, then its id dim beside it
+      expect(await ui.find({ type: "Text", text: scout.id })).toBeDefined();
+      // each detail row is a dim label column and its value (no space padding)
+      expect(await ui.find({ type: "Text", text: /^asked haiku · running claude-haiku-4-5-20251001/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^list the files here/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^README\.md, notes\.txt/ })).toBeDefined();
+      for (const key of ["view", "steer", "interrupt", "more", "open", "close-thread", "refresh", "close-pane"]) {
         expect(await ui.find({ key })).toBeDefined();
       }
+      // Model sits behind More
+      expect(await ui.find({ key: "model" })).toBeUndefined();
+      await ui.press({ key: "more" });
+      expect(await ui.find({ key: "model" })).toBeDefined();
       await ui.press({ key: "view" });
       expect(await ui.find({ type: "Text", text: /hello from the screen/ })).toBeDefined();
       await ui.press({ key: "others" });
@@ -1031,6 +1044,26 @@ describe("threads: pane and band", () => {
     expect(await after.find({ type: "Text", text: "⇶ 1 thread · 1 working · /threads" })).toBeDefined();
     await after.unmount();
   });
+
+  // The band is shared: Threads sits beneath the other mods' bands, so each of them has to pass
+  // on what `next` drew, and Threads does the same for what lies beneath it (its row goes last,
+  // beside the prompt). A mod above that drops `next` hides this row (prompt-rail's horizontal
+  // rail did until 0.7.1-local.2).
+  for (const surface of ["terminal", "desktop"] as const) {
+    test(`band keeps what lies beneath it and adds its row last (${surface})`, async ($, on) => {
+      const w = fresh();
+      on("ui.render", { component: "AbovePrompt" } as any, ($: any, e: any) => $.ui.resolve(e).Text({ children: "another mod's band" }));
+      await boot($, on, w);
+      await threads($, "new haiku Haiku scout -- a");
+      const band = await $.ui.mount({ plugin: "threads", surface, component: "AbovePrompt", props: BAND } as any);
+      const drawn = await band.findAll({});
+      const theirs = drawn.findIndex((node: any) => node.type === "Text" && node.text === "another mod's band");
+      const ours = drawn.findIndex((node: any) => node.type === "Text" && /^⇶ 1 thread/.test(String(node.text)));
+      expect(theirs).toBeGreaterThanOrEqual(0);
+      expect(ours).toBeGreaterThan(theirs);
+      await band.unmount();
+    });
+  }
 
   test("help and unknown options", async ($, on) => {
     const w = fresh();
@@ -1214,15 +1247,18 @@ describe("threads: inline backend", () => {
       expect(await threads($, "")).toMatch(/Threads pane open: 1 live thread/);
       const ui = await $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
       expect(await ui.find({ key: `sel:${t.id}` })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /model  asked haiku · running/ })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /cwd    \/work\/app · inline agent agent-1/ })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /tool  Bash ls/ })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /says  Found 3 files\./ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^asked haiku · running/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^\/work\/app · inline agent agent-1/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^Bash ls/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^Found 3 files\./ })).toBeDefined();
       expect(await ui.find({ key: "approve" })).toBeUndefined();
       expect(await ui.find({ key: "model" })).toBeUndefined();
+      await ui.press({ key: "more" });
+      expect(await ui.find({ key: "model" })).toBeUndefined(); // an inline thread has no model to switch, even under More
+      expect(await ui.find({ key: "effort" })).toBeDefined();
       await ui.press({ key: "view" });
-      expect(await ui.find({ type: "Text", text: "Live activity (last 30)" })).toBeDefined();
-      expect(await ui.find({ type: "Text", text: /tool  Read \/work\/app\/notes\.txt/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: "Activity" })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^Read \/work\/app\/notes\.txt/ })).toBeDefined();
       await ui.press({ key: "steer" });
       await ui.input({ key: "steer-input", text: "skip node_modules" });
       expect(w.sent).toEqual([{ to: "agent-1", text: "skip node_modules" }]);
@@ -1653,7 +1689,7 @@ describe("threads: plans end to end (stubbed engine)", () => {
       expect(await ui.find({ type: "Text", text: /handoff .*plan-p[0-9a-f]+-phase-01-/ })).toBeDefined();
       expect(await ui.find({ type: "Text", text: `threads ${p1.id} → ·` })).toBeDefined();
       await ui.press({ key: "plan-view" });
-      expect(await ui.find({ type: "Text", text: /model  asked haiku · running .* · effort low/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^asked haiku · running .* · effort low/ })).toBeDefined();
       await ui.unmount();
     });
   }
@@ -1859,19 +1895,27 @@ describe("threads: pane buttons", () => {
     test(`every action is a button, with a hint line, on ${surface}`, async ($, on) => {
       const w = fresh();
       await boot($, on, w);
+      // the hint is for an empty pane: it goes once the chat has a thread
+      const empty = await $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
+      if (surface === "terminal") expect(await empty.find({ type: "Text", text: /^Click a thread or any button\. Keys: ctrl\+x then tab gives the pane the keyboard/ })).toBeDefined();
+      else {
+        expect(await empty.find({ type: "Text", text: /^Click a thread or any button\. You can also ask in the chat/ })).toBeDefined();
+        expect(await empty.find({ type: "Text", text: /ctrl\+x/ })).toBeUndefined(); // no terminal advice on desktop
+      }
+      await empty.unmount();
       await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "auto", phases: PHASES } as any);
       const t = registry(w).threads[0];
       await threads($, "");
       const ui = await $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
-      if (surface === "terminal") expect(await ui.find({ type: "Text", text: /^Click a thread or any button\. Keys: ctrl\+x then tab gives the pane the keyboard/ })).toBeDefined();
-      else {
-        expect(await ui.find({ type: "Text", text: /^Click a thread or any button\. You can also ask in the chat/ })).toBeDefined();
-        expect(await ui.find({ type: "Text", text: /ctrl\+x/ })).toBeUndefined(); // no terminal advice on desktop
-      }
-      for (const key of [`sel:${t.id}`, "view", "steer", "interrupt", "model", "effort", "open", "pin", "archive", "close-thread", "refresh", "plan-view", "close-pane"]) {
+      expect(await ui.find({ type: "Text", text: /^Click a thread or any button\./ })).toBeUndefined();
+      // Model, Effort, Pin, Archive and Rename sit behind More
+      for (const key of [`sel:${t.id}`, "view", "steer", "interrupt", "more", "open", "close-thread", "refresh", "plan-view", "close-pane"]) {
         const b = await ui.find({ key });
         expect(b?.type).toBe("Button");
       }
+      for (const key of ["model", "effort", "pin", "archive", "rename"]) expect(await ui.find({ key })).toBeUndefined();
+      await ui.press({ key: "more" });
+      for (const key of ["model", "effort", "pin", "archive", "rename"]) expect((await ui.find({ key }))?.type).toBe("Button");
       // model and effort open clickable choices in the pane (no dialog needed)
       await ui.press({ key: "effort" });
       expect(await ui.find({ key: "pick:effort:high" })).toBeDefined();
@@ -1978,8 +2022,9 @@ describe("threads: cost", () => {
     expect(wait.result).toMatch(/\$0\.011 est\. API-equivalent/);
     await threads($, "");
     const ui = await $.ui.mount({ plugin: "threads", surface: "desktop", component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
-    expect(await ui.find({ type: "Text", text: /^cost   \$0\.011 est\. API-equivalent/ })).toBeDefined();
-    expect(await ui.find({ type: "Text", text: "$0.011" })).toBeDefined();
+    // the pane rounds to whole cents; the list, the wait output and the record keep the finer figure
+    expect(await ui.find({ type: "Text", text: /^\$0\.01 est\. API-equivalent/ })).toBeDefined();
+    expect(await ui.find({ type: "Text", text: "$0.01" })).toBeDefined();
     await ui.unmount();
 
     const w2 = w;
@@ -2000,7 +2045,8 @@ describe("threads: show and open (desktop first)", () => {
     expect(r.result).toMatch(/^Opened the Threads pane beside this chat: 1 live thread of this chat, t[0-9a-f]+ selected/);
     expect(w.panes.has("threads")).toBe(true);
     const ui = await $.ui.mount({ plugin: "threads", surface: "desktop", component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
-    expect(await ui.find({ type: "Text", text: `Thread | Haiku scout  (${t.id})` })).toBeDefined();
+    expect(await ui.find({ type: "Text", text: "Haiku scout" })).toBeDefined();
+    expect(await ui.find({ type: "Text", text: t.id })).toBeDefined();
     await ui.unmount();
     expect(((await $.tool.call({ tool: "mcp__threads__threads_show", id: "nope" } as any)) as any).result).toMatch(/No thread matches/);
   });
@@ -2385,6 +2431,420 @@ describe("threads: Codex computer use", () => {
     const sc: any = readScreen("╭──╮\n│ Allow Codex computer use to use Calculator? │\n│ a This session  l Always allow  d Deny │\n╰──╯");
     expect(sc).toMatchObject({ needsYou: true, cuApproval: "Calculator" });
     expect(sc.prompt).toMatch(/Codex computer use wants to use Calculator/);
+    const now: any = readScreen("╭──╮\n│ Allow Codex to use Notes? │\n│ Wants to: Add a note │\n│ Allow in this chat  Always allow  Deny │\n╰──╯");
+    expect(now).toMatchObject({ needsYou: true, cuApproval: "Notes" });
   });
 });
 
+// ---- the pane's polish: hotkeys shown once, clean data, one main action, the layout ----------------
+
+describe("threads: pane polish", () => {
+  const SURFACES = ["terminal", "desktop"] as const;
+  const MARKDOWN = "## Done\n**3 files** changed in `/home/tester/work/app/src/a.ts`, see [the notes](https://x.y/n) and __this__\n- all pass";
+
+  const mountPane = ($: any, surface: string, bodyColumns = 140) =>
+    $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: { ...PANE_PROPS, bodyColumns } } as any);
+
+  // a lead chat with a scout (listed first, so selected) and a critic, in the states a test asks for
+  async function paneWorld($: any, on: any, states: { scout?: "idle" | "working"; critic?: "working" | "needs-you" } = {}, extra: (w: World, scout: any, critic: any) => void = () => {}) {
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- scan /home/tester/work/app/src for TODOs");
+    await threads($, "new sonnet Sonnet critic -- read README.md");
+    const scout = created(w, "Haiku scout");
+    const critic = created(w, "Sonnet critic");
+    if (states.scout === "idle") setSession(w, scout.sessionId, { status: "idle" });
+    if (states.critic === "needs-you") w.tmux.get(critic.tmux)!.screen = PERMISSION_SCREEN;
+    extra(w, scout, critic);
+    await threads($, "list");
+    await threads($, "");
+    return { w, scout, critic };
+  }
+
+  function nodeOf(n: any, key: string): any {
+    if (!n || typeof n === "string") return undefined;
+    if (n.props?.key === key) return n;
+    for (const c of n.children ?? []) {
+      const hit = nodeOf(c, key);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+  // the elements from the root down to the one with this key
+  function pathTo(n: any, key: string): any[] {
+    if (!n || typeof n === "string") return [];
+    if (n.props?.key === key) return [n];
+    for (const c of n.children ?? []) {
+      const sub = pathTo(c, key);
+      if (sub.length) return [n, ...sub];
+    }
+    return [];
+  }
+  // what a node shows, in document order: its strings and its Buttons' labels
+  function shows(n: any, out: string[] = []): string[] {
+    if (typeof n === "string") out.push(n);
+    else if (n?.type === "Button") out.push(n.props.label);
+    else for (const c of n?.children ?? []) shows(c, out);
+    return out;
+  }
+  const buttonsOf = async (ui: any) => (await ui.findAll({ type: "Button" })) as any[];
+  const keysOf = async (ui: any) => (await buttonsOf(ui)).map((b) => b.key);
+  const primariesOf = async (ui: any) => (await buttonsOf(ui)).filter((b) => b.props.variant === "primary").map((b) => b.key);
+
+  describe("unit", () => {
+    test("keyLabel: the letter leads the label only where no hotkey badge is drawn", () => {
+      expect(keyLabel("Refresh", "r", false)).toBe("r Refresh");
+      expect(keyLabel("Refresh", "r", true)).toBe("Refresh");
+      expect(keyLabel("Pick", undefined, false)).toBe("Pick");
+    });
+
+    test("paneMoney: whole cents, a trace, nothing", () => {
+      expect(paneMoney(0.913)).toBe("$0.91");
+      expect(paneMoney(0.01)).toBe("$0.01");
+      expect(paneMoney(12.3456)).toBe("$12.35");
+      expect(paneMoney(0.0042)).toBe("<$0.01");
+      expect(paneMoney(0)).toBe("$0");
+      expect(paneMoney(undefined)).toBe("$0");
+      // the model-facing money() keeps its finer figures
+      expect(money(0.913)).toBe("$0.913");
+    });
+
+    test("paneTime: hours and minutes of the local day, no seconds", () => {
+      expect(paneTime(new Date(2026, 9, 3, 7, 5, 59).getTime())).toBe("07:05");
+      expect(paneTime(0)).toBe("");
+    });
+
+    test("plainText: emphasis, backticks, headings and links go; code spans keep their text", () => {
+      expect(plainText("**bold** and __strong__ words")).toBe("bold and strong words");
+      expect(plainText("run `npm test` now")).toBe("run npm test now");
+      expect(plainText("## Summary\nbody\n### Deeper\nmore")).toBe("Summary\nbody\nDeeper\nmore");
+      expect(plainText("see [the notes](https://x.y/n?a=1) for more")).toBe("see the notes for more");
+      expect(plainText("**bold `code`** end")).toBe("bold code end");
+      // underscores inside a code span are a name, not emphasis
+      expect(plainText("edit `__init__.py` and `a_b_c`")).toBe("edit __init__.py and a_b_c");
+      expect(plainText("a * b and 2 ** 3 are maths")).toBe("a * b and 2 ** 3 are maths");
+      expect(plainText("no markup here")).toBe("no markup here");
+      expect(plainText(undefined)).toBe("");
+    });
+
+    test("plainTail: a transcript line keeps its tag column", () => {
+      expect(plainTail("says  ## Done: **3 files** in `src`")).toBe("says  Done: 3 files in src");
+      expect(plainTail("tool  Bash ls -la")).toBe("tool  Bash ls -la");
+    });
+
+    test("tidyPath: home is ~, a long path loses its middle but keeps its last two segments", () => {
+      expect(tidyPath("/Users/dawizkidmal/proj/a.ts", 40)).toBe("~/proj/a.ts");
+      expect(tidyPath("/home/tester/proj", 40)).toBe("~/proj");
+      expect(tidyPath("/work/app", 40)).toBe("/work/app");
+      const long = "/Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs";
+      expect(tidyPath(long, 24)).toBe("~/…/hooks/threads.mjs");
+      // with room to spare it keeps as much of the head as fits
+      expect(tidyPath(long, 32)).toBe("~/.claude/…/hooks/threads.mjs");
+      expect(tidyPath("/srv/data/shared/deep/dir/file.txt", 18)).toBe("/…/dir/file.txt");
+      expect(tidyPath("src/very/deep/nest/of/dirs/file.ts", 24)).toBe("src/very/…/dirs/file.ts");
+      // never wider than asked, even when no middle form fits: the tail survives
+      for (const max of [1, 5, 12, 20]) expect(tidyPath(long, max).length).toBeLessThanOrEqual(max);
+      expect(tidyPath(long, 12).endsWith("threads.mjs")).toBe(true);
+      expect(tidyPath("/Users/me/a-very-long-single-file-name.txt", 10).length).toBeLessThanOrEqual(10);
+    });
+
+    test("tidyPaths: home becomes ~ inside a line; a too-wide line shortens its longest paths", () => {
+      expect(tidyPaths("edit /Users/me/proj/a.ts and /home/me/b.ts now")).toBe("edit ~/proj/a.ts and ~/b.ts now");
+      expect(tidyPaths("fits as it is: /work/app/a.ts", 80)).toBe("fits as it is: /work/app/a.ts");
+      const line = "says  fixed /Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs in one go";
+      const fit = tidyPaths(line, 70);
+      expect(fit.length).toBeLessThanOrEqual(70);
+      expect(fit).toMatch(/^says {2}fixed ~\/.*…\/hooks\/threads\.mjs in one go$/);
+      // a line too long to fit even with every path shortened keeps its paths whole, for the caller's clip to cut
+      const prose = "Done: changed /Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs and then a very long explanation follows here";
+      expect(tidyPaths(prose, 60)).toBe(prose.replace("/Users/me", "~"));
+      // a URL is not a path, and a slash command stays as typed
+      expect(tidyPaths("see https://example.com/a/b/c/d/e and run /threads new", 20)).toBe("see https://example.com/a/b/c/d/e and run /threads new");
+      expect(tidyPaths(undefined)).toBe("");
+    });
+  });
+
+  test("hotkeys show once: no letter prefix on the desktop, the terminal keeps it (it draws no badge)", async ($, on) => {
+    const { critic } = await paneWorld($, on, { critic: "needs-you" });
+    const expected: Record<string, [string, string]> = {
+      refresh: ["Refresh", "r"], "close-pane": ["Close", "c"], view: ["Screen", "w"], approve: ["Approve", "y"], deny: ["Deny", "n"],
+      open: ["Open", "o"], more: ["Less", "d"], "close-thread": ["Close", "x"], steer: ["Steer", "s"], interrupt: ["Interrupt", "i"],
+      model: ["Model", "m"], effort: ["Effort", "e"], pin: ["Pin", "u"], archive: ["Archive", "v"], rename: ["Rename", "t"],
+    };
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      await ui.press({ key: `sel:${critic.id}` });
+      await ui.press({ key: "more" });
+      for (const [key, [name, hotkey]] of Object.entries(expected)) {
+        const b = await ui.find({ key });
+        expect(b?.props.hotkey).toBe(hotkey);
+        expect(b?.props.label).toBe(surface === "desktop" ? name : `${hotkey} ${name}`);
+      }
+      // nothing on the desktop leads with a letter
+      if (surface === "desktop") for (const b of await buttonsOf(ui)) expect(String(b.props.label)).not.toMatch(/^[a-z] \S/);
+      await ui.press({ key: "more" }); // fold it again: the choice is remembered across drawings
+      await ui.unmount();
+    }
+  });
+
+  test("at most one primary button; Approve is primary only for a thread that needs you", async ($, on) => {
+    const { scout, critic } = await paneWorld($, on, { scout: "idle", critic: "needs-you" });
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      await ui.press({ key: `sel:${scout.id}` });
+      expect(await primariesOf(ui)).toEqual([]);
+      expect(await ui.find({ key: "approve" })).toBeUndefined();
+      await ui.press({ key: `sel:${critic.id}` });
+      expect(await primariesOf(ui)).toEqual(["approve"]);
+      expect((await ui.find({ key: "approve" }))?.props.variant).toBe("primary");
+      expect((await ui.find({ key: "deny" }))?.props.variant).toBeUndefined();
+      // an open picker marks its current choice with a tick: it adds no second primary
+      await ui.press({ key: "more" });
+      await ui.press({ key: "effort" });
+      expect(await ui.find({ key: "pick:cancel" })).toBeDefined();
+      expect(await primariesOf(ui)).toEqual(["approve"]);
+      await ui.press({ key: "more" });
+      await ui.unmount();
+    }
+  });
+
+  test("the main row follows the thread: Approve and Deny when it needs you, Steer and Interrupt when it is live", async ($, on) => {
+    const { critic, scout } = await paneWorld($, on, { critic: "needs-you" });
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      // a working thread
+      await ui.press({ key: `sel:${scout.id}` });
+      expect(await keysOf(ui)).toEqual(expect.arrayContaining(["steer", "interrupt", "open", "more", "close-thread"]));
+      expect(await keysOf(ui)).not.toContain("approve");
+      // one that needs you: the decision leads, steering moves under More
+      await ui.press({ key: `sel:${critic.id}` });
+      let keys = await keysOf(ui);
+      expect(keys).toEqual(expect.arrayContaining(["approve", "deny", "open", "more", "close-thread"]));
+      expect(keys.indexOf("approve")).toBeLessThan(keys.indexOf("open"));
+      expect(keys).not.toContain("steer");
+      expect(keys).not.toContain("interrupt");
+      await ui.press({ key: "more" });
+      keys = await keysOf(ui);
+      expect(keys).toEqual(expect.arrayContaining(["steer", "interrupt", "model", "effort", "pin", "archive", "rename"]));
+      await ui.press({ key: "more" });
+      await ui.unmount();
+    }
+    // a closed thread has nothing to steer or close, and still opens
+    await threads($, `close ${scout.id}`);
+    const ui = await mountPane($, "desktop");
+    await ui.press({ key: `sel:${scout.id}` });
+    const keys = await keysOf(ui);
+    expect(keys).toEqual(expect.arrayContaining(["open", "more"]));
+    for (const gone of ["steer", "interrupt", "close-thread", "approve"]) expect(keys).not.toContain(gone);
+    await ui.unmount();
+  });
+
+  test("More shows Pin, Archive and Rename (and Model and Effort for a live session) and hides them again", async ($, on) => {
+    const { w, scout } = await paneWorld($, on);
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      const behind = ["model", "effort", "pin", "archive", "rename"];
+      for (const key of behind) expect(await ui.find({ key })).toBeUndefined();
+      expect((await ui.find({ key: "more" }))?.props.label).toMatch(/More$/);
+      await ui.press({ key: "more" });
+      for (const key of behind) expect((await ui.find({ key }))?.type).toBe("Button");
+      expect((await ui.find({ key: "more" }))?.props.label).toMatch(/Less$/);
+      // an open picker goes when More folds
+      await ui.press({ key: "model" });
+      expect(await ui.find({ key: "pick:model:sonnet" })).toBeDefined();
+      await ui.press({ key: "more" });
+      expect(await ui.find({ key: "pick:model:sonnet" })).toBeUndefined();
+      for (const key of behind) expect(await ui.find({ key })).toBeUndefined();
+      await ui.unmount();
+    }
+    // the buttons under More still work, and More stays open
+    const ui = await mountPane($, "desktop");
+    await ui.press({ key: "more" });
+    await ui.press({ key: "pin" });
+    expect(created(w, "Haiku scout").pinned).toBe(true);
+    expect((await ui.find({ key: "pin" }))?.props.label).toBe("Unpin");
+    await ui.press({ key: "rename" });
+    await ui.input({ key: "rename-input", text: "Scout two" });
+    expect(created(w, "Scout two")?.id).toBe(scout.id);
+    await ui.press({ key: "archive" });
+    expect(created(w, "Scout two").archived).toBe(true);
+    await ui.unmount();
+  });
+
+  test("Close is set apart: last in a row that pushes it to the far edge; the header's controls sit right-aligned", async ($, on) => {
+    await paneWorld($, on);
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      const tree = await ui.drawn();
+      const row = pathTo(tree, "close-thread").at(-2);
+      expect(row.props.justifyContent).toBe("space-between");
+      expect(row.children.at(-1).props.key).toBe("close-thread");
+      // no dismiss role on it: a desktop would draw that as a second pane-close control
+      expect(nodeOf(tree, "close-thread").props.role).toBeUndefined();
+      expect(nodeOf(tree, "close-pane").props.role).toBe("dismiss");
+      const head = pathTo(tree, "refresh").at(-3);
+      expect(head.props.justifyContent).toBe("space-between");
+      expect(shows(head.children[0])[0]).toBe("Threads");
+      await ui.unmount();
+    }
+  });
+
+  test("the report and the transcript are plain text; a screen capture is left as it is, apart from home", async ($, on) => {
+    const { scout } = await paneWorld($, on, { scout: "idle" }, (w, _scout) => {
+      const reg = registry(w);
+      reg.threads.find((x: any) => x.id === _scout.id).lastReport = { text: MARKDOWN, at: T0 + 5000, source: "peer" };
+      w.fs.set(REG, JSON.stringify(reg));
+      w.fs.set(
+        transcriptPath(APP, _scout.sessionId),
+        [userRow("scan the hooks"), assistant("## Found\n**3 TODOs** in `__init__.py` at /home/tester/work/app/src/a.ts and [more](https://x.y)")].join("\n"),
+      );
+      w.tmux.get(_scout.tmux)!.screen = "│ **raw** `x` # keep /home/tester/work/app/a.ts │";
+    });
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      await ui.press({ key: `sel:${scout.id}` });
+      const report = await ui.find({ type: "Text", text: /^Done 3 files changed in ~\/work\/app\/src\/a\.ts, see the notes and this/ });
+      expect(report).toBeDefined();
+      expect(report?.props.color).toBe("cyan");
+      expect(report?.text).not.toMatch(/\*\*|__|`|\]\(|#/);
+      const says = await ui.find({ type: "Text", text: /^Found 3 TODOs in __init__\.py at ~\/work\/app\/src\/a\.ts and more$/ });
+      expect(says).toBeDefined();
+      expect(says?.text).not.toMatch(/\*\*|`|\]\(|#/);
+      expect(await ui.find({ type: "Text", text: "/home/tester" })).toBeUndefined();
+      // Screen: a raw capture keeps its marks, and only the path is tidied
+      await ui.press({ key: "view" });
+      expect(await ui.find({ type: "Text", text: "│ **raw** `x` # keep ~/work/app/a.ts │" })).toBeDefined();
+      await ui.press({ key: "view" });
+      await ui.unmount();
+    }
+  });
+
+  test("pane money has two decimals; a trace is <$0.01 and nothing is $0; the list keeps the finer figure", async ($, on) => {
+    await paneWorld($, on, { scout: "idle" }, (w, t, c) => {
+      w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 })); // 0.013 + 0.9
+      w.fs.set(transcriptPath(APP, c.sessionId), usageRow("m2", "claude-haiku-4-5-20251001", { input_tokens: 0, output_tokens: 800 })); // 0.004
+    });
+    await threads($, "new haiku Fresh -- x"); // no spend yet
+    expect(await threads($, "list")).toMatch(/\$0\.913 est\./); // model-facing text is unchanged
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      expect(await ui.find({ type: "Text", text: /^\$0\.91 est\. API-equivalent/ })).toBeDefined(); // the Cost row of the first thread
+      expect(await ui.find({ type: "Text", text: "$0.91" })).toBeDefined(); // its tree row
+      expect(await ui.find({ type: "Text", text: "<$0.01" })).toBeDefined(); // the critic's trace
+      expect(await ui.find({ type: "Text", text: /^· 3 live · \$0\.92 est\. · updated / })).toBeDefined(); // the header
+      expect(await ui.find({ type: "Text", text: /^3 live · cap \d+ · \$0\.92 est\.$/ })).toBeDefined(); // the tree footer
+      expect(await ui.findAll({ type: "Text", text: /\$\d+\.\d{3}/ })).toHaveLength(0);
+      await ui.unmount();
+    }
+  });
+
+  test("a thread with no spend shows $0, and the header leaves the total out", async ($, on) => {
+    const { scout } = await paneWorld($, on);
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      await ui.press({ key: `sel:${scout.id}` });
+      expect(await ui.find({ type: "Text", text: /^\$0 est\. API-equivalent/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /est\. · updated/ })).toBeUndefined();
+      await ui.unmount();
+    }
+  });
+
+  test("the header reads 'Threads · N live · $X est. · updated HH:MM', with no seconds", async ($, on) => {
+    await paneWorld($, on);
+    const d = new Date(T0);
+    const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      const meta = await ui.find({ type: "Text", text: /^· \d+ live/ });
+      expect(meta?.text).toBe(`· 2 live · updated ${hhmm}`);
+      expect(meta?.text).not.toMatch(/\d\d:\d\d:\d\d/);
+      expect(meta?.props.dimColor).toBe(true);
+      expect((await ui.find({ type: "Text", text: "Threads" }))?.props.bold).toBe(true);
+      await ui.unmount();
+    }
+  });
+
+  test("the hint shows only while the chat has no threads, and the empty state invites", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      expect(await ui.find({ type: "Text", text: /^Click a thread or any button\./ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: "Start a thread" })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: "Ask in the chat (spin up a Haiku thread to …) or run /threads new haiku Scout -- <task>" })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /no threads yet/ })).toBeUndefined(); // an invitation, not an apology
+      await ui.unmount();
+    }
+    await threads($, "new haiku Haiku scout -- a");
+    await threads($, "");
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      expect(await ui.find({ type: "Text", text: /^Click a thread or any button\./ })).toBeUndefined();
+      expect(await ui.find({ type: "Text", text: "Start a thread" })).toBeUndefined();
+      await ui.unmount();
+    }
+  });
+
+  test("a tree row reads: marker, dot, title button, model, then the new chip and the cost", async ($, on) => {
+    const { scout } = await paneWorld($, on, { scout: "idle" }, (w, t) => {
+      const reg = registry(w);
+      reg.threads.find((x: any) => x.id === t.id).lastReport = { text: "found it", at: T0 + 5000, source: "peer" };
+      w.fs.set(REG, JSON.stringify(reg));
+      w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 }));
+    });
+    for (const surface of SURFACES) {
+      const ui = await mountPane($, surface);
+      const row = nodeOf(await ui.drawn(), `row:${scout.id}`);
+      expect(shows(row).map((s) => s.trim()).filter(Boolean)).toEqual(["›", "○", "Haiku scout", "haiku", "new", "$0.91"]);
+      const title = nodeOf(row, `sel:${scout.id}`);
+      expect(title.props.hotkey).toBe("1");
+      expect(title.props.plain).toBe(true);
+      await ui.unmount();
+    }
+  });
+
+  // wide: the tree left and the detail right; narrow: stacked. Each section is one blank row apart.
+  const STATES: Array<[string, Parameters<typeof paneWorld>[2]]> = [
+    ["idle", { scout: "idle" }],
+    ["working", {}],
+    ["needs-you", { critic: "needs-you" }],
+  ];
+  for (const [name, states] of STATES) {
+    test(`a ${name} thread draws on both surfaces, wide and narrow, More open or not`, async ($, on) => {
+      const { scout, critic } = await paneWorld($, on, states);
+      const target = name === "needs-you" ? critic : scout;
+      for (const surface of SURFACES) {
+        for (const cols of [140, 80]) {
+          const ui = await mountPane($, surface, cols);
+          await ui.press({ key: `sel:${target.id}` });
+          for (const more of [false, true]) {
+            if (more) await ui.press({ key: "more" });
+            const tree = await ui.drawn();
+            const body = (tree.children as any[]).at(-1);
+            expect(body.props.marginTop).toBe(1);
+            expect(body.props.flexDirection).toBe(cols >= 96 ? "row" : "column");
+            expect(pathTo(tree, "view").at(-3).props.marginTop).toBe(1); // the transcript section
+            expect(pathTo(tree, "close-thread").at(-3).props.marginTop).toBe(1); // the actions
+            expect(Boolean(await ui.find({ key: "rename" }))).toBe(more);
+          }
+          await ui.press({ key: "more" });
+          await ui.unmount();
+        }
+      }
+    });
+  }
+
+  test("the empty pane draws on both surfaces, wide and narrow", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    for (const surface of SURFACES) {
+      for (const cols of [140, 80]) {
+        const ui = await mountPane($, surface, cols);
+        const body = ((await ui.drawn()).children as any[]).at(-1);
+        expect(body.props.flexDirection).toBe(cols >= 96 ? "row" : "column");
+        expect(await ui.find({ type: "Text", text: "Start a thread" })).toBeDefined();
+        await ui.unmount();
+      }
+    }
+  });
+});
