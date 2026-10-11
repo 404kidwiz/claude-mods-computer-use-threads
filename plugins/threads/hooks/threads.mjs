@@ -223,6 +223,8 @@ export function register(on, options) {
 
   on("tool.call", { tool: "mcp__threads__threads_create" }, async ($, e) => {
     startTicker($);
+    const refused = await bypassRefused($, [e.permission_mode]);
+    if (refused) return { deny: refused };
     const made = await createThread($, {
       model: e.model,
       title: e.title,
@@ -350,6 +352,9 @@ export function register(on, options) {
 
   on("tool.call", { tool: "mcp__threads__threads_plan" }, async ($, e) => {
     startTicker($);
+    const phases = Array.isArray(e?.phases) ? e.phases : [];
+    const refused = await bypassRefused($, phases.map((ph) => ph?.permission_mode ?? ph?.permissionMode));
+    if (refused) return { deny: refused };
     const made = await createPlan($, e);
     if (made.error) return { deny: made.error };
     return { result: made.text };
@@ -2029,6 +2034,14 @@ async function setThreadModel($, t, rawModel) {
 async function defaultMode($) {
   const stored = checkMode(await $.store.get(MODE_KEY)).mode;
   return stored ?? configuredMode ?? DEFAULT_MODE;
+}
+
+// The model may not raise a thread to bypassPermissions on its own: only when the person's
+// default (/threads mode or the defaultPermissionMode setting) is already bypass.
+async function bypassRefused($, modes) {
+  if (!modes.some((m) => checkMode(m).mode === "bypassPermissions")) return "";
+  if ((await defaultMode($)) === "bypassPermissions") return "";
+  return "Refused: permission_mode bypassPermissions needs the person's opt-in. Leave permission_mode out to use their default, or ask them to run /threads mode bypassPermissions.";
 }
 
 async function setThreadEffort($, t, raw) {
