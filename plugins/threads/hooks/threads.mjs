@@ -103,6 +103,7 @@ import {
   paneMoney,
   paneTime,
   plainText,
+  tidyFolder,
   tidyPath,
   tidyPaths,
 } from "./core.mjs";
@@ -732,32 +733,48 @@ export function register(on, options) {
         }),
       );
       const statusText = `${dotOf(t.status)} ${t.status}`;
-      const folder = `${tidyPath(t.cwd, isInline ? 40 : valueW, home)}${isInline ? ` · inline agent ${t.agentId}` : ""}`;
+      // The dim facts beside the status word, in the room it leaves: `· 12s old · mode · folder · inline agent id`. The folder is
+      // budgeted to what the rest of the line leaves (tidyFolder floors it at ~/…/parent/dir, or drops it), so no part of it is cut
+      // mid-word, and the mode and then the age give way before an inline thread's agent id would be cut. A wide pane puts the
+      // folder and the agent on the Folder row instead.
+      const room = rightW - statusText.length - 1;
+      const agent = isInline ? `inline agent ${t.agentId}` : "";
+      const old = `${age((view.refreshedAt || 0) - (t.createdAt || 0))} old`;
+      const line = (...parts) => `· ${parts.filter(Boolean).join(" · ")}`;
+      const tail = isWide ? "" : agent;
+      const lead = [[old, t.permissionMode], [old], []].find((l) => line(...l, tail).length <= room) ?? [];
+      const folder = tidyFolder(t.cwd, isWide ? valueW - (agent ? agent.length + 3 : 0) : room - line(...lead, tail).length - 3, home);
       who.push(
         Box({
           flexDirection: "row",
           gap: 1,
-          children: [
-            Text({ color: colorOf(t.status), children: statusText }),
-            dim(`· ${age((view.refreshedAt || 0) - (t.createdAt || 0))} old · ${t.permissionMode}${isWide ? "" : ` · ${folder}`}`, rightW - statusText.length - 1),
-          ],
+          children: [Text({ color: colorOf(t.status), children: statusText }), dim(line(...lead, isWide ? "" : folder, tail), room)],
         }),
       );
 
+      // what needs the person, between the status line and the buttons: the question reads before Approve and Deny, which answer it
+      const alerts = [];
+      if (t.status === "needs-you" && t.prompt && isInline) {
+        alerts.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
+      } else if (t.status === "needs-you" && t.prompt) {
+        alerts.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
+      }
+      if (t.status === "needs-login") alerts.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
+      if (t.status === "needs-trust") {
+        alerts.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
+      }
+
       // the reference rows, under the actions: what it runs on, where, what it was asked, what it cost
       const details = [];
-      // the reason for a status that needs the person, first, so it reads straight after the buttons that answer it
-      if (t.status === "needs-you" && t.prompt && isInline) {
-        details.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)} (answer it in this chat)`, rightW) }));
-      } else if (t.status === "needs-you" && t.prompt) {
-        details.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
-      }
-      if (t.status === "needs-login") details.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
-      if (t.status === "needs-trust") {
-        details.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
-      }
       details.push(field("Model", `asked ${t.requestedModel} · running ${verified}${t.effort ? ` · effort ${t.effort}` : ""}`));
-      if (isWide) details.push(field("Folder", folder));
+      if (isWide) {
+        // the Folder row names an inline agent too while both fit; when they do not the agent gets its own row, never a clipped id
+        if (folder || !agent) details.push(field("Folder", [folder || tidyPath(t.cwd, valueW, home), agent].filter(Boolean).join(" · ")));
+        else {
+          details.push(field("Folder", tidyFolder(t.cwd, valueW, home) || tidyPath(t.cwd, valueW, home)));
+          details.push(field("Agent", `inline · ${t.agentId}`));
+        }
+      }
       details.push(field("Task", tidyPaths(oneLine(t.task), valueW, home)));
       details.push(field("Cost", `${paneMoney(t.costUsd)} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
       if (t.lastReport?.text) details.push(field("Report", tidyPaths(oneLine(plainText(t.lastReport.text)), valueW, home), "cyan"));
@@ -922,10 +939,11 @@ export function register(on, options) {
         }
       }
 
-      // the actions come right after the status line, ahead of the reference rows: they are what is reached for, and at
-      // the default pane height (a third of the screen) the rows below the first dozen are not seen
+      // the actions come right after the status line (and the alert lines that say why they are needed), ahead of the reference rows:
+      // they are what is reached for, and at the default pane height (a third of the screen) the rows below the first dozen are not seen
       right.push(
         Box({ flexDirection: "column", children: who }),
+        ...(alerts.length ? [Box({ flexDirection: "column", children: alerts })] : []),
         Box({ flexDirection: "column", children: actions }),
         Box({ flexDirection: "column", children: details }),
         Box({ flexDirection: "column", marginTop: 1, children: feed }),
@@ -934,7 +952,11 @@ export function register(on, options) {
 
     const liveCount = mine.filter((t) => LIVE.has(t.status)).length;
     const stamp = paneTime(view.refreshedAt);
-    const meta = `· ${liveCount} live${totalCost ? ` · ${paneMoney(totalCost)} est.` : ""} · ${stamp ? `updated ${stamp}` : "not refreshed yet"}`;
+    const metaOf = (cost) => `· ${liveCount} live${totalCost ? ` · ${paneMoney(totalCost)}${cost}` : ""} · ${stamp ? `updated ${stamp}` : "not refreshed yet"}`;
+    // beside the title there are width - 8 cells; where the facts do not fit them the word "est." goes first (the Cost row says it), and
+    // where they still do not, they wrap under the title whole (the left box wraps) instead of ending in `updated…`
+    const full = metaOf(" est.");
+    const meta = full.length <= width - 8 ? full : metaOf("");
     // the title and its dim facts on the left, the pane's controls right-aligned. Where the two do not fit one row the controls
     // wrap under the title, so the facts may take the whole width; clipping them to what the controls leave cut them (· $0.94 est. · updated 08…)
     // even though the controls had wrapped away from them.
@@ -950,7 +972,7 @@ export function register(on, options) {
       justifyContent: "space-between",
       gap: 1,
       children: [
-        Box({ flexDirection: "row", gap: 1, children: [Text({ bold: true, children: "Threads" }), dim(meta, width - 8)] }),
+        Box({ flexDirection: "row", flexWrap: "wrap", gap: 1, children: [Text({ bold: true, children: "Threads" }), dim(meta, width)] }),
         Box({ flexDirection: "row", gap: 1, children: headSpecs.map((s) => btn(...s)) }),
       ],
     });

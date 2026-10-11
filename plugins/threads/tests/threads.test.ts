@@ -32,6 +32,7 @@ import {
   paneTime,
   homePath,
   plainText,
+  tidyFolder,
   tidyPath,
   tidyPaths,
 } from "../hooks/core.mjs";
@@ -2558,6 +2559,16 @@ describe("threads: pane polish", () => {
       expect(plainText("**bold** next to __it all__.")).toBe("bold next to it all.");
     });
 
+    test("plainText: a pair of unquoted globs is not emphasis, but a real strong beside it still goes", () => {
+      // the ** after "exclude " would open on "/" and the one after "dist/" would close on it: neither is emphasis
+      expect(plainText("exclude **/dist/** from the build")).toBe("exclude **/dist/** from the build");
+      expect(plainText("**/*.ts and **/dist/** here")).toBe("**/*.ts and **/dist/** here");
+      expect(plainText("exclude **/dist/** and use **bold** here")).toBe("exclude **/dist/** and use bold here");
+      expect(plainText("**bold** and **/dist/** here")).toBe("bold and **/dist/** here");
+      // a mark that opens or closes on a space is not emphasis either
+      expect(plainText("a ** b ** c")).toBe("a ** b ** c");
+    });
+
     test("plainText: a fenced block is code, so its # comments and stars stay; a heading outside it still goes", () => {
       const text = "## Result\nrun it:\n```python\n# comment\nx = 1  # note\n## not a heading\nf(*a, **kw)\n```\n### After\n# Title";
       expect(plainText(text)).toBe("Result\nrun it:\npython\n# comment\nx = 1  # note\n## not a heading\nf(*a, **kw)\n\nAfter\nTitle");
@@ -2583,6 +2594,20 @@ describe("threads: pane polish", () => {
       for (const max of [1, 5, 12, 20]) expect(tidyPath(long, max, "/Users/me").length).toBeLessThanOrEqual(max);
       expect(tidyPath(long, 12, "/Users/me").endsWith("threads.mjs")).toBe(true);
       expect(tidyPath("/Users/me/a-very-long-single-file-name.txt", 10, "/Users/me").length).toBeLessThanOrEqual(10);
+    });
+
+    test("tidyFolder: whole segments or nothing, never a cut through a name", () => {
+      const long = "/home/tester/.claude/local-marketplaces/claude-mods-computer-use-threads";
+      expect(tidyFolder(long, 100, HOME)).toBe("~/.claude/local-marketplaces/claude-mods-computer-use-threads");
+      expect(tidyFolder(long, 55, HOME)).toBe("~/…/local-marketplaces/claude-mods-computer-use-threads"); // tidyPath's floor
+      expect(tidyFolder(long, 54, HOME)).toBe("…/claude-mods-computer-use-threads"); // below it, the last segment alone
+      expect(tidyFolder(long, 34, HOME)).toBe("…/claude-mods-computer-use-threads");
+      for (const max of [33, 20, 5, 1, 0, -3]) expect(tidyFolder(long, max, HOME)).toBe(""); // no room: no folder, not `…ocal-marketplaces/cl…`
+      expect(tidyFolder("/work/app", 5, HOME)).toBe("…/app");
+      expect(tidyFolder("/work/app/", 5, HOME)).toBe("…/app"); // a trailing slash is no segment
+      expect(tidyFolder("/work/app", 4, HOME)).toBe("");
+      expect(tidyFolder("/work/app", 40, HOME)).toBe("/work/app");
+      expect(tidyFolder("", 10, HOME)).toBe("");
     });
 
     test("home: only the real home becomes ~; a path that merely looks like one is left alone", () => {
@@ -2975,47 +3000,96 @@ describe("threads: pane polish", () => {
     expect(w.opened.at(-1)?.rows).toBe(rows);
   });
 
-  test("the actions sit right under the status line, ahead of the detail rows, inside the first screenful at 80 and 140 columns", async ($, on) => {
-    const { scout } = await paneWorld($, on, { scout: "idle" }, (w, t) => {
-      const reg = registry(w);
-      reg.threads.find((x: any) => x.id === t.id).lastReport = { text: "found it", at: T0 + 5000, source: "peer" };
-      w.fs.set(REG, JSON.stringify(reg));
-    });
-    for (const surface of SURFACES) {
-      for (const cols of [140, 80]) {
-        const ui = await mountPane($, surface, cols);
-        await ui.press({ key: `sel:${scout.id}` });
-        const tree = await ui.drawn();
-        // the selected thread's column, in order: who (title, status), the actions, the detail rows, the feed
-        const right = pathTo(tree, "close-thread").at(-4);
-        const [who, actions, details, feed] = right.children;
-        expect(who.children).toHaveLength(2);
-        expect(shows(who.children[1])[0]).toBe("○ idle");
-        expect(nodeOf(actions, "open")).toBeDefined();
-        expect(nodeOf(actions, "more")).toBeDefined();
-        expect(nodeOf(actions, "close-thread")).toBeDefined();
-        expect(nodeOf(details, "open")).toBeUndefined();
-        expect(shows(details.children[0])[0]).toBe("Model");
-        expect(nodeOf(feed, "view")).toBeDefined();
-        // nothing between the status line and the actions: they are adjacent rows
-        expect(heightOf(who)).toBe(2);
-        expect(actions.props.marginTop).toBeUndefined();
-        expect(rowsAbove(right, "open") - (right.props.marginTop ?? 0)).toBe(2); // title, status, then the buttons
-        // the actions are inside the first screenful, and ahead of Model, Task, Cost and Report in reading order
-        expect(rowsAbove(tree, "close-thread") + 1).toBeLessThanOrEqual(FIRST_ROWS);
-        const labels = shows(tree);
-        const at = (label: RegExp) => labels.findIndex((l) => label.test(l));
-        for (const label of [/^Model$/, /^Task$/, /^Cost$/, /^Report$/]) expect(at(label)).toBeGreaterThan(at(/Open$/));
-        if (cols >= 96) {
-          // wide: the feed heading and its Screen toggle show too (they were the 13th row, cut off, before)
-          expect(rowsAbove(tree, "view") + 1).toBeLessThanOrEqual(FIRST_ROWS - 1);
-        } else {
-          expect(rowsAbove(tree, "view") + 1).toBeGreaterThan(FIRST_ROWS); // stacked: the feed follows the tree and the details
+  // an idle thread has no alert line; a needs-you one has its "waiting:" line, which sits between the status line and the actions
+  for (const [name, alertRows] of [["idle", 0], ["needs-you", 1]] as const) {
+    test(`the actions sit right under the status line${alertRows ? " and the alert line" : ""}, ahead of the detail rows, inside the first screenful at 80 and 140 columns (${name})`, async ($, on) => {
+      const { scout, critic } = await paneWorld($, on, { scout: "idle", critic: "needs-you" }, (w, t) => {
+        const reg = registry(w);
+        reg.threads.find((x: any) => x.id === t.id).lastReport = { text: "found it", at: T0 + 5000, source: "peer" };
+        w.fs.set(REG, JSON.stringify(reg));
+      });
+      const target = alertRows ? critic : scout;
+      const first = alertRows ? "approve" : "open"; // the first button of the action row
+      for (const surface of SURFACES) {
+        for (const cols of [140, 80]) {
+          const ui = await mountPane($, surface, cols);
+          await ui.press({ key: `sel:${target.id}` });
+          const tree = await ui.drawn();
+          // the selected thread's column, in order: who (title, status), the alert lines if any, the actions, the detail rows, the feed
+          const right = pathTo(tree, "close-thread").at(-4);
+          expect(right.children).toHaveLength(4 + alertRows);
+          const [who, ...rest] = right.children;
+          const alerts = alertRows ? rest.shift() : undefined;
+          const [actions, details, feed] = rest;
+          expect(who.children).toHaveLength(2);
+          expect(shows(who.children[1])[0]).toBe(alertRows ? "◆ needs-you" : "○ idle");
+          if (alerts) {
+            expect(alerts.children).toHaveLength(alertRows);
+            expect(shows(alerts)[0]).toMatch(/^waiting: /);
+            expect(nodeOf(alerts, "approve")).toBeUndefined();
+          }
+          expect(nodeOf(actions, first)).toBeDefined();
+          expect(nodeOf(actions, "open")).toBeDefined();
+          expect(nodeOf(actions, "more")).toBeDefined();
+          expect(nodeOf(actions, "close-thread")).toBeDefined();
+          expect(nodeOf(details, "open")).toBeUndefined();
+          expect(shows(details.children[0])[0]).not.toMatch(/^waiting: /); // the alert is not repeated down in the details
+          expect(shows(details.children[0])[0]).toBe("Model");
+          expect(nodeOf(feed, "view")).toBeDefined();
+          // nothing between the status line and the actions but the alert lines: they are adjacent rows
+          expect(heightOf(who)).toBe(2);
+          expect(actions.props.marginTop).toBeUndefined();
+          expect(rowsAbove(right, first) - (right.props.marginTop ?? 0)).toBe(2 + alertRows); // title, status, the alerts, then the buttons
+          // the actions are inside the first screenful, and ahead of Model, Task and Cost (and Report) in reading order
+          expect(rowsAbove(tree, "close-thread") + 1).toBeLessThanOrEqual(FIRST_ROWS);
+          const labels = shows(tree);
+          const at = (label: RegExp) => labels.findIndex((l) => label.test(l));
+          for (const label of alertRows ? [/^Model$/, /^Task$/, /^Cost$/] : [/^Model$/, /^Task$/, /^Cost$/, /^Report$/]) expect(at(label)).toBeGreaterThan(at(/Open$/));
+          if (cols >= 96) {
+            // wide: the feed heading and its Screen toggle show too (they were the 13th row, cut off, before)
+            expect(rowsAbove(tree, "view") + 1).toBeLessThanOrEqual(FIRST_ROWS - 1);
+          } else {
+            expect(rowsAbove(tree, "view") + 1).toBeGreaterThan(FIRST_ROWS); // stacked: the feed follows the tree and the details
+          }
+          await ui.unmount();
         }
-        await ui.unmount();
       }
-    }
-  });
+    });
+  }
+
+  // the question is read before the buttons that answer it
+  const REASONS: Array<[string, string, RegExp]> = [
+    ["needs-you", PERMISSION_SCREEN, /^waiting: .*rm -rf build/],
+    ["needs-login", "Login expired · Please run /login", /^Threads need the terminal/],
+    ["needs-trust", "Do you trust the files in this folder?\n❯ 1. Yes, I trust this folder", /^Sits on the folder trust prompt/],
+  ];
+  for (const [status, screen, reason] of REASONS) {
+    test(`a ${status} thread draws its reason above its buttons${status === "needs-you" ? ", Approve and Deny included" : ""}`, async ($, on) => {
+      const { critic } = await paneWorld($, on, {}, (w, _scout, c) => {
+        w.tmux.get(c.tmux)!.screen = screen;
+      });
+      for (const surface of SURFACES) {
+        for (const cols of [140, 80, 40]) {
+          const ui = await mountPane($, surface, cols);
+          await ui.press({ key: `sel:${critic.id}` });
+          const labels = shows(await ui.drawn());
+          const at = (label: RegExp) => labels.findIndex((l) => label.test(l));
+          expect(labels).toContain(`◆ ${status}`);
+          expect(at(reason)).toBeGreaterThan(at(/^◆ /)); // under the status line
+          for (const b of status === "needs-you" ? [/Approve$/, /Deny$/, /Open$/] : [/Open$/]) {
+            expect(at(b)).toBeGreaterThan(at(reason));
+            expect(at(/^Model$/)).toBeGreaterThan(at(b)); // and the reference rows stay below the buttons
+          }
+          if (status === "needs-you") {
+            // Approve stays the one primary button, and Deny follows it
+            expect(at(/Approve$/)).toBeLessThan(at(/Deny$/));
+            expect(await primariesOf(ui)).toEqual(["approve"]);
+          }
+          await ui.unmount();
+        }
+      }
+    });
+  }
 
   test("a stacked pane folds the Folder row into the status line; a wide one keeps the row", async ($, on) => {
     const { scout } = await paneWorld($, on, { scout: "idle" });
@@ -3042,6 +3116,147 @@ describe("threads: pane polish", () => {
     expect(await ui.find({ type: "Text", text: "Folder" })).toBeUndefined();
     expect(await ui.find({ type: "Text", text: /^· \d+s old · \S+ · \/work\/app · inline agent agent-1$/ })).toBeDefined();
     await ui.unmount();
+  });
+
+  // The stacked status line is `· 12s old · mode · folder`: the folder gets what the status word and the rest leave it, floors at
+  // ~/…/parent/dir and then at …/dir, and is left out when there is no room, so it never ends in a cut like …ocal-marketplaces/cl…
+  const LONG_CWD = "/home/tester/.claude/local-marketplaces/claude-mods-computer-use-threads";
+  const DEEP_CWD = "/home/tester/work/clients/acme/app/services/api";
+  const setFolder = (cwd: string) => (w: World, t: any) => {
+    const reg = registry(w);
+    Object.assign(reg.threads.find((x: any) => x.id === t.id), { cwd, permissionMode: "bypassPermissions" });
+    w.fs.set(REG, JSON.stringify(reg));
+  };
+  // the status word and the dim facts after it, with the age made 0s
+  const statusLine = async (ui: any) => {
+    const word = (await ui.find({ type: "Text", text: /^[◌●○◆] [a-z-]+$/ }))?.text as string;
+    const facts = (await ui.find({ type: "Text", text: /^· (?:\d+s old|.*inline agent)/ }))?.text as string;
+    return { word, facts: facts?.replace(/^· \d+s old/, "· 0s old") };
+  };
+  const STACKED_FOLDERS: Array<[string, Record<number, string>]> = [
+    [LONG_CWD, { 80: "· 0s old · bypassPermissions · …/claude-mods-computer-use-threads", 60: "· 0s old · bypassPermissions", 40: "· 0s old · bypassPermissions" }],
+    [DEEP_CWD, { 80: "· 0s old · bypassPermissions · ~/work/clients/acme/app/services/api", 60: "· 0s old · bypassPermissions · ~/work/…/services/api", 40: "· 0s old · bypassPermissions" }],
+  ];
+  for (const [cwd, want] of STACKED_FOLDERS) {
+    test(`a long folder in the stacked status line keeps its last segment or goes, at 80, 60 and 40 columns (${cwd.split("/").pop()})`, async ($, on) => {
+      const { scout } = await paneWorld($, on, { scout: "idle" }, setFolder(cwd));
+      for (const surface of SURFACES) {
+        for (const cols of [80, 60, 40]) {
+          const ui = await mountPane($, surface, cols);
+          await ui.press({ key: `sel:${scout.id}` });
+          const { word, facts } = await statusLine(ui);
+          expect(word).toBe("○ idle");
+          expect(facts).toBe(want[cols]);
+          expect(facts.length).toBeLessThanOrEqual(cols - word.length - 1); // never clipped by the Text: nothing is cut
+          expect(facts).not.toContain("ocal-marketplaces"); // the old output: `· … · …ocal-marketplaces/cl…`
+          const folder = facts.replace(/^· 0s old · bypassPermissions( · )?/, ""); // what follows the mode: the folder, or nothing
+          expect(folder === "" || folder.endsWith(`/${cwd.split("/").pop()}`)).toBe(true); // it ends in the last segment
+          await ui.unmount();
+        }
+      }
+    });
+  }
+
+  test("an inline thread's stacked status line budgets the folder around the agent id and never cuts the id", async ($, on) => {
+    const w = fresh({ loggedIn: false });
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- list the files");
+    const reg = registry(w);
+    for (const t of reg.threads) Object.assign(t, { cwd: LONG_CWD, permissionMode: "bypassPermissions" });
+    w.fs.set(REG, JSON.stringify(reg));
+    await threads($, "list");
+    await threads($, "");
+    const want: Record<number, string> = {
+      80: "· 0s old · bypassPermissions · inline agent agent-1",
+      60: "· 0s old · inline agent agent-1", // the mode gives way before the id would
+      40: "· inline agent agent-1", // then the age
+    };
+    for (const cols of [80, 60, 40]) {
+      const ui = await mountPane($, "terminal", cols);
+      const { word, facts } = await statusLine(ui);
+      expect(facts).toBe(want[cols]);
+      expect(facts.length).toBeLessThanOrEqual(cols - word.length - 1);
+      await ui.unmount();
+    }
+    // a folder that does fit goes between the mode and the id, down to its floor at 60 and the last segment at 40
+    for (const t of reg.threads) t.cwd = DEEP_CWD;
+    w.fs.set(REG, JSON.stringify(reg));
+    await threads($, "list");
+    const deep: Record<number, string> = {
+      80: "· 0s old · bypassPermissions · ~/…/services/api · inline agent agent-1",
+      60: "· 0s old · ~/…/services/api · inline agent agent-1",
+      40: "· …/api · inline agent agent-1",
+    };
+    for (const cols of [80, 60, 40]) {
+      const ui = await mountPane($, "terminal", cols);
+      const { word, facts } = await statusLine(ui);
+      expect(facts).toBe(deep[cols]);
+      expect(facts.length).toBeLessThanOrEqual(cols - word.length - 1);
+      await ui.unmount();
+    }
+  });
+
+  test("a wide pane's Folder row for an inline thread keeps the agent id whole: beside the folder when both fit, on its own row when not", async ($, on) => {
+    const w = fresh({ loggedIn: false });
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- list the files");
+    const reg = registry(w);
+    for (const t of reg.threads) Object.assign(t, { cwd: LONG_CWD, permissionMode: "bypassPermissions" });
+    w.fs.set(REG, JSON.stringify(reg));
+    await threads($, "list");
+    await threads($, "");
+    for (const surface of SURFACES) {
+      const roomy = await mountPane($, surface, 140);
+      expect(await roomy.find({ type: "Text", text: "~/.claude/local-marketplaces/claude-mods-computer-use-threads · inline agent agent-1" })).toBeDefined();
+      expect(await roomy.find({ type: "Text", text: "Agent" })).toBeUndefined();
+      await roomy.unmount();
+      const tight = await mountPane($, surface, 96); // 51 cells for the value: the folder's last segment and the id cannot share the row
+      expect(await tight.find({ type: "Text", text: "…/claude-mods-computer-use-threads" })).toBeDefined();
+      expect(await tight.find({ type: "Text", text: "Agent" })).toBeDefined();
+      expect(await tight.find({ type: "Text", text: "inline · agent-1" })).toBeDefined();
+      expect(await tight.findAll({ type: "Text", text: /…ocal-marketplaces/ })).toHaveLength(0);
+      await tight.unmount();
+    }
+  });
+
+  // the dim facts beside the title are width - 8 cells: "est." goes first, and facts that still do not fit wrap under the title whole
+  test("the header's 'updated HH:MM' is never cut by a cost at 40 and 44 columns: est. goes first", async ($, on) => {
+    await paneWorld($, on, {}, (w, t) => {
+      w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 }));
+    });
+    for (const surface of SURFACES) {
+      for (const [cols, want] of [
+        [40, /^· 2 live · \$0\.91 · updated \d\d:\d\d$/],
+        [44, /^· 2 live · \$0\.91 · updated \d\d:\d\d$/],
+        [45, /^· 2 live · \$0\.91 est\. · updated \d\d:\d\d$/], // it fits beside the title again: the word comes back
+      ] as Array<[number, RegExp]>) {
+        const ui = await mountPane($, surface, cols);
+        const meta = await ui.find({ type: "Text", text: /^· \d+ live/ });
+        expect(meta?.text).toMatch(want);
+        expect(meta?.text).not.toContain("…");
+        expect(meta!.text.length).toBeLessThanOrEqual(cols - 8); // on the title's row
+        await ui.unmount();
+      }
+    }
+  });
+
+  test("a cost too wide for the title's row wraps under the title whole at 40 columns instead of ending in 'updated…', and sits beside it at 44", async ($, on) => {
+    await paneWorld($, on, {}, (w, t) => {
+      w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 0, output_tokens: 2470000 })); // $12.35
+    });
+    for (const surface of SURFACES) {
+      for (const cols of [40, 44]) {
+        const ui = await mountPane($, surface, cols);
+        const meta = await ui.find({ type: "Text", text: /^· \d+ live/ });
+        expect(meta?.text).toMatch(/^· 2 live · \$12\.35 · updated \d\d:\d\d$/); // est. gone, nothing cut
+        if (cols === 40) expect(meta!.text.length).toBeGreaterThan(cols - 8); // so it cannot share the title's row...
+        expect(meta!.text.length).toBeLessThanOrEqual(cols);
+        const left = ((await ui.drawn()).children as any[])[0].children[0]; // ...and the title's box wraps it below
+        expect(left.props.flexWrap).toBe("wrap");
+        expect(shows(left)).toEqual(["Threads", meta!.text]);
+        await ui.unmount();
+      }
+    }
   });
 
   test("the header facts are never clipped by room the buttons do not use: whole at 80 and 60 columns, with the Plan button too", async ($, on) => {
@@ -3072,7 +3287,7 @@ describe("threads: pane polish", () => {
       w.fs.set(transcriptPath(APP, t.sessionId), usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 13000, output_tokens: 180000 }));
     });
     for (const surface of SURFACES) {
-      for (const cols of [96, 97, 98, 100, 110, 140, 80]) {
+      for (const cols of [96, 97, 98, 100, 110, 140, 80, 60, 40]) {
         const ui = await mountPane($, surface, cols);
         const tree = await ui.drawn();
         const column = pathTo(tree, `row:${scout.id}`).at(-2);

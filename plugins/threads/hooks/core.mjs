@@ -1385,6 +1385,16 @@ export function tidyPath(path, max, home = "") {
   return `…${p.slice(p.length - Math.max(0, max - 1))}`;
 }
 
+// A folder for a line with only `max` cells to give it: tidyPath's result while that still ends in whole segments
+// (`~/…/parent/dir`), else the last segment alone (`…/dir`), else nothing. Never a cut through the middle of a name.
+export function tidyFolder(path, max, home = "") {
+  const tidy = tidyPath(path, max, home);
+  if (!tidy.startsWith("…")) return tidy;
+  const last = homePath(path, home).replace(/\/+$/, "").split("/").pop();
+  const short = `…/${last}`;
+  return last && short.length <= max ? short : "";
+}
+
 // A line of text with home shown as ~ in every path in it and, when the line is wider than `width`, the
 // longest paths shortened (each keeps its last two segments) so that it fits. When even that would not
 // fit, every path still goes to its floor (`~/…/parent/file`): the caller clips the line, and that clip then
@@ -1418,10 +1428,11 @@ export function tidyPaths(text, width = Infinity, home = "") {
 // first (`__init__` keeps its underscores) and a mark only counts where prose would put one:
 //   `code`      its text
 //   [text](url) the text, but not after a word or bracket (`handlers[i](event)` is an index and a call)
-//   **strong**  not after a word, "*" or "/" and not before one (`x**2 + y**2`, `src/**/*.ts` are not emphasis)
+//   **strong**  not after a word, "*" or "/" and not before one, and not opening or closing on "/" or a space
+//               (`x**2 + y**2`, `src/**/*.ts` and a pair of globs, `**/dist/**`, are not emphasis)
 //   __strong__  only around words with a space inside and no __ of their own (`__init__`, `__main__`, `my__file__name`
 //               are names, and so is each in "the __init__ method and the __call__ method")
-const MARKUP = /`([^`\n]+)`|(?<![\w\])])\[([^\]\n]+)\]\([^)\s]*\)|(?<![\w*/])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*/])|(?<!\w)__(?=\S)((?:(?!__)[^\n])*?\s(?:(?!__)[^\n])*?)(?<=\S)__(?!\w)/g;
+const MARKUP = /`([^`\n]+)`|(?<![\w\])])\[([^\]\n]+)\]\([^)\s]*\)|(?<![\w*/])\*\*(?=[^\s/])(.+?)(?<=[^\s/])\*\*(?![\w*/])|(?<!\w)__(?=\S)((?:(?!__)[^\n])*?\s(?:(?!__)[^\n])*?)(?<=\S)__(?!\w)/g;
 const FENCE = /^[ \t]{0,3}`{3,}[^`]*$/;
 
 // Markdown out of a model's words, for a pane that draws plain text: emphasis, backticks, leading #
