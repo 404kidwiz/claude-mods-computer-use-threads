@@ -207,7 +207,7 @@ export const register: Register = on => {
       // What the call set out to do, in the model's own words for the person (never its code).
       const title = oneLine((args as { title?: unknown }).title)
       await update($, pending, () => (title === '' ? { app } : { app, title }))
-      await $.ui.open({ id: PANE, title: 'Codex computer use', focus: true, closeOnEscape: true, rows: 8 })
+      await $.ui.open({ id: PANE, title: 'Codex computer use', focus: true, closeOnEscape: true, rows: 10 })
       return fail(
         `Codex needs the person's approval to use ${app}. They are being asked in the codex-cu prompt now. Stop and wait: a message will say whether they allowed it, and then you can retry the same call.`,
       )
@@ -322,18 +322,18 @@ export const register: Register = on => {
     const autoLine = standing.autoApproveAll
       ? 'Auto-approve: ON, every app is allowed without asking (/codex-cu auto off to ask again).'
       : 'Auto-approve: off (/codex-cu auto on to allow every app without asking).'
-    const allowedLine = apps.length > 0 ? `Allowed this session: ${apps.join(', ')}.` : 'No apps allowed through the pane yet this session.'
+    const allowedLine = apps.length > 0 ? `Allowed in this chat: ${apps.join(', ')}.` : 'No apps allowed through the pane in this chat yet.'
     const alwaysLine = `Always allowed: ${always.length > 0 ? always.join(', ') : 'none'} (revoke with /codex-cu forget <app>). Apps set to "Always" inside Codex are allowed too.`
 
-    let usersLine = 'Sessions using it now: none (the daemon is not running).'
+    let usersLine = 'Chats using it now: none (the daemon is not running).'
     try {
       const res = await $.http.fetch('http://codex-cu/sessions', { socketPath: `${home}/.claude/mcp/codex-cu/daemon.sock` })
       const me = await $.session.id()
       const users: { session: string; busy: boolean; leases: string[]; idleSeconds: number }[] = res.ok ? JSON.parse(res.text) : []
       usersLine = users.length === 0
-        ? 'Sessions using it now: none.'
-        : `Sessions using it now (each with its own Codex session): ${users
-            .map(u => `${u.session.startsWith(me) ? 'this session' : u.session.slice(0, 8)}${u.session.includes('/') ? ' (subagent)' : ''}${u.busy ? ' working' : ` idle ${u.idleSeconds}s`}${u.leases.length > 0 ? `, holds ${u.leases.join(', ')}` : ''}`)
+        ? 'Chats using it now: none.'
+        : `Chats using it now (each with its own Codex session): ${users
+            .map(u => `${u.session.startsWith(me) ? 'this chat' : u.session.slice(0, 8)}${u.session.includes('/') ? ' (subagent)' : ''}${u.busy ? ' working' : ` idle ${u.idleSeconds}s`}${u.leases.length > 0 ? `, holds ${u.leases.join(', ')}` : ''}`)
             .join('; ')}.`
     } catch {
       // daemon not running

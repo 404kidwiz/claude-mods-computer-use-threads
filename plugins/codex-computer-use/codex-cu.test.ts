@@ -145,7 +145,7 @@ test('session end frees its Codex sessions; status lists who holds which app', a
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   await $.session.start(start)
   const status = await $.command.run({ command: 'codex-cu', args: 'status', origin: { kind: 'composer' } } as any)
-  expect(String(status.text)).toContain('Sessions using it now (each with its own Codex session): this session idle 3s, holds TextEdit; abcdef12 working, holds Calculator.')
+  expect(String(status.text)).toContain('Chats using it now (each with its own Codex session): this chat idle 3s, holds TextEdit; abcdef12 working, holds Calculator.')
   await $.session.end({ reason: 'exit', sessionId: 'sess-1', resume: {} } as any)
   expect(calls.at(-1)).toEqual({ url: 'http://codex-cu/end', body: { session: 'sess-1' } })
 })
