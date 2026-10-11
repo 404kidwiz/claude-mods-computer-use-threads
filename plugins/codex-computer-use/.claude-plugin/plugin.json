@@ -1,6 +1,6 @@
 {
   "name": "codex-computer-use",
-  "version": "0.5.0-local.2",
+  "version": "0.5.0-local.3",
   "description": "Route Claude's desktop computer use through Codex's computer-use engine, one Codex session per Claude session so threads can drive apps in parallel. Toggle with /codex-cu on|off.",
   "types": "./types/index.d.ts",
   "author": {
