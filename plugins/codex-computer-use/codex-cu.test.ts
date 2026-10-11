@@ -1,6 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import { typesUnread } from './hooks/register.tsx'
 import type { On } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
 
 // Stands in for the engine beneath the mod: a store, a status line, a tool list
 // and tool calls that just report which tool ran.
@@ -175,3 +176,184 @@ test('the raw Codex tool is denied when it types unread', async ($, on) => {
   const looked = await $.tool.call({ tool: 'mcp__codex-cu__js', tool_use_id: 'e', code: 'await app.getAXState(); await app.typeText("x")' })
   expect(looked.text).toBe('ran mcp__codex-cu__js')
 })
+
+// The approval pane, on the two surfaces the mod is used from. The kit hands back the drawn tree
+// as data, not a paint, so these check what the tree asks each surface to draw.
+const SURFACES = ['terminal', 'desktop'] as const
+const PLUGIN = 'codex-computer-use'
+const PANE = 'codex-approval'
+const paneProps = (bodyColumns = 60) =>
+  ({ title: 'Codex computer use', isFocused: true, bodyColumns, placement: 'inline', scroll: { offset: 0, bodyRows: 8 }, view: {} }) as const
+
+// An approval waiting for Calculator: the bridge call the daemon declined opens the pane. The
+// effects a press has outside the pane (panes closed, files written, prompts sent) are recorded;
+// `retry` repeats the call and says which apps the mod then told the daemon were allowed, the
+// session's `allowed` list as the daemon sees it.
+const awaiting = async ($: Engine, on: On, title?: string) => {
+  engine(on)
+  const bodies: any[] = []
+  const closed: string[] = []
+  const writes: { path: string; text: string }[] = []
+  const prompts: { text: string; asUser: boolean }[] = []
+  on('mcp.call', () => ({ deny: 'not connected in this session' }))
+  on('http.fetch', ($, e) => {
+    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v2' } }
+    const body = JSON.parse(String(e.init?.body))
+    bodies.push(body)
+    // like the daemon: Calculator is declined until it is among the apps the mod approves
+    const isApproved: boolean = body.approve.includes('Calculator')
+    const headers: Record<string, string> = isApproved ? {} : { 'x-codex-declined': '["Calculator"]' }
+    return { value: { status: isApproved ? 200 : 422, ok: isApproved, headers, text: isApproved ? 'done' : 'not approved' } }
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.close', ($, e) => {
+    closed.push(e.id)
+    return { value: undefined }
+  })
+  on('fs.read', () => ({ value: JSON.stringify({ apps: ['Notes'], autoApproveAll: false }) }))
+  on('fs.write', ($, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  on('prompt.submit', ($, e) => {
+    prompts.push({ text: e.text, asUser: (e.origin as { asUser?: boolean }).asUser === true })
+    return { text: e.text }
+  })
+  await $.session.start(start)
+  const call = { tool: 'mcp__codex-computer-use__cua', tool_use_id: 'a', code: 'let app = await cua.getApp("Calculator"); app.click(3)' }
+  const run = () => $.tool.call((title === undefined ? call : { ...call, title }) as any)
+  await run()
+  const retry = async () => {
+    await run()
+    return bodies.at(-1).approve as string[]
+  }
+
+  return { bodies, closed, writes, prompts, retry }
+}
+
+const mountPane = ($: Engine, surface: (typeof SURFACES)[number], bodyColumns?: number) =>
+  $.ui.mount({ plugin: PLUGIN, surface, component: 'Pane', requestId: PANE, props: paneProps(bodyColumns) })
+
+// The tree as indented text: each element with its props, a Text with what it shows.
+const dump = (node: any, depth = 0): string => {
+  const props = Object.entries(node.props ?? {}).map(([k, v]) => (v === true ? k : `${k}=${v}`))
+  const text = (node.children ?? []).filter((c: unknown) => typeof c === 'string').join('')
+  const line = `${'  '.repeat(depth)}${[node.type, ...props].join(' ')}${text === '' ? '' : `: ${text}`}`
+  const kids = (node.children ?? []).filter((c: unknown) => typeof c !== 'string').map((c: unknown) => dump(c, depth + 1))
+
+  return [line, ...kids].join('\n')
+}
+
+const COPY = 'Codex clicks and types in Calculator in the background. Undo an always-allow with /codex-cu forget Calculator.'
+const DUMPS = {
+  terminal: `Box flexDirection=column gap=1
+  Box flexDirection=column
+    Text bold: Allow Codex to use Calculator?
+    Text wrap=truncate-end: Wants to: Add 2 + 2 in Calculator
+  Text dimColor: ${COPY}
+  Box gap=2 flexWrap=wrap
+    Button key=allow label=Allow in this chat hotkey=a plain variant=primary autoFocus
+    Button key=always label=Always allow hotkey=l plain
+    Button key=deny label=Deny hotkey=d plain role=dismiss`,
+  desktop: `Box flexDirection=column gap=1
+  Box flexDirection=column
+    Text bold: Allow Codex to use Calculator?
+    Text wrap=truncate-end: Wants to: Add 2 + 2 in Calculator
+  Text dimColor: ${COPY}
+  Box gap=2 flexWrap=wrap
+    Button key=allow label=Allow in this chat hotkey=a variant=primary autoFocus
+    Button key=always label=Always allow hotkey=l
+    Button key=deny label=Deny hotkey=d role=dismiss`,
+}
+
+for (const surface of SURFACES) {
+  test(`${surface}: a titled approval says what is about to happen, and the choices carry their keys`, async ($, on) => {
+    await awaiting($, on, 'Add 2 + 2 in Calculator')
+    const ui = await mountPane($, surface)
+
+    expect(dump(await ui.drawn())).toBe(DUMPS[surface])
+    expect((await ui.find({ type: 'Text', text: 'Allow Codex to use Calculator?' }))?.props.bold).toBe(true)
+    expect((await ui.find({ type: 'Text', text: 'Wants to: Add 2 + 2 in Calculator' }))?.text).toBe('Wants to: Add 2 + 2 in Calculator')
+
+    const buttons = await ui.findAll({ type: 'Button' })
+    expect(buttons.map(b => [b.key, b.props.label, b.props.hotkey])).toEqual([
+      ['allow', 'Allow in this chat', 'a'],
+      ['always', 'Always allow', 'l'],
+      ['deny', 'Deny', 'd'],
+    ])
+    expect(buttons.filter(b => b.props.variant === 'primary').map(b => b.key)).toEqual(['allow'])
+    expect(buttons.filter(b => b.props.autoFocus === true).map(b => b.key)).toEqual(['allow'])
+    expect((await ui.find({ key: 'deny' }))?.props.role).toBe('dismiss')
+    // the terminal draws `[ label ]` without the hotkey unless the Button is plain (`a: label`)
+    expect(buttons.map(b => b.props.plain === true)).toEqual(surface === 'terminal' ? [true, true, true] : [false, false, false])
+  })
+
+  test(`${surface}: with no title there is no "Wants to" line, and the code is never shown`, async ($, on) => {
+    await awaiting($, on)
+    const ui = await mountPane($, surface)
+
+    expect(await ui.find({ text: /Wants to/ })).toBeUndefined()
+    expect((await ui.find({ type: 'Text', text: 'Allow Codex to use Calculator?' }))?.props.bold).toBe(true)
+    expect(dump(await ui.drawn())).not.toContain('getApp')
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(3)
+  })
+
+  test(`${surface}: the title stays on one line, within the pane`, async ($, on) => {
+    await awaiting($, on, '  Open\n  a new   document in TextEdit and type the quarterly summary into it  ')
+    const ui = await mountPane($, surface, 40)
+    const wants = (await ui.find({ type: 'Text', text: /^Wants to:/ }))?.text ?? ''
+    expect(wants).toBe('Wants to: Open a new document in TextEd…')
+    expect(wants).toHaveLength(40)
+    expect(wants).not.toContain('\n')
+  })
+
+  test(`${surface}: allow keeps the app for this chat, clears the ask, closes the pane and asks Claude to retry`, async ($, on) => {
+    const { closed, writes, prompts, retry } = await awaiting($, on, 'Add 2 + 2 in Calculator')
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'allow' })
+
+    expect((await ui.find({ type: 'Text' }))?.text).toBe('No approval waiting.')
+    expect(closed).toEqual([PANE])
+    expect(writes).toEqual([])
+    expect(prompts).toEqual([{ text: 'I allowed Codex computer use to use Calculator for this chat. Retry the last call and continue the task.', asUser: true }])
+    expect(await retry()).toEqual(['Calculator'])
+  })
+
+  test(`${surface}: always allow also keeps the app in the standing list, beside the apps already there`, async ($, on) => {
+    const { closed, writes, prompts, retry } = await awaiting($, on)
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'always' })
+
+    expect((await ui.find({ type: 'Text' }))?.text).toBe('No approval waiting.')
+    expect(closed).toEqual([PANE])
+    expect(writes).toHaveLength(1)
+    expect(JSON.parse(writes[0]?.text ?? '')).toEqual({ apps: ['Notes', 'Calculator'], autoApproveAll: false })
+    // the standing list lives here; /codex-cu forget, which the pane names, edits this file
+    expect(writes[0]?.path).toBe('/tmp/.claude/mcp/codex-cu/always-allowed.json')
+    expect(prompts).toEqual([{ text: 'I always allowed Codex computer use to use Calculator. Retry the last call and continue the task.', asUser: true }])
+    expect(await retry()).toEqual(['Calculator'])
+  })
+
+  test(`${surface}: deny keeps the app out, clears the ask, closes the pane and tells Claude to stop`, async ($, on) => {
+    const { closed, writes, prompts, retry } = await awaiting($, on, 'Add 2 + 2 in Calculator')
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'deny' })
+
+    expect((await ui.find({ type: 'Text' }))?.text).toBe('No approval waiting.')
+    expect(closed).toEqual([PANE])
+    expect(writes).toEqual([])
+    expect(prompts).toEqual([{ text: 'I denied Codex computer use for Calculator. Do not use Calculator; tell me another way or stop.', asUser: true }])
+    expect(await retry()).toEqual([])
+  })
+
+  test(`${surface}: with nothing to approve the pane says so, dim`, async ($, on) => {
+    engine(on)
+    await $.session.start(start)
+    const ui = await mountPane($, surface)
+
+    const empty = await ui.find({ type: 'Text' })
+    expect(empty?.text).toBe('No approval waiting.')
+    expect(empty?.props.dimColor).toBe(true)
+    expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  })
+}

@@ -27,6 +27,13 @@ const ALWAYS_FILE = '.claude/mcp/codex-cu/always-allowed.json'
 
 type Standing = { apps: string[]; autoApproveAll: boolean }
 
+// The model writes the title, so it may hold newlines or run long; the pane shows it on one row.
+const oneLine = (text: unknown) => (typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '')
+const clip = (line: string, columns: number) => {
+  const cells = Array.from(line)
+  return cells.length > columns ? `${cells.slice(0, Math.max(1, columns - 1)).join('')}…` : line
+}
+
 async function readStanding($: EngineInterface, home: string): Promise<Standing> {
   try {
     const parsed = JSON.parse(String(await $.fs.read(`${home}/${ALWAYS_FILE}`)))
@@ -197,8 +204,10 @@ export const register: Register = on => {
     const declined: string[] = JSON.parse(res.headers['x-codex-declined'] ?? '[]')
     if (declined.length > 0) {
       const app = declined[0]
-      await update($, pending, () => ({ app }))
-      await $.ui.open({ id: PANE, title: 'Codex computer use', focus: true, closeOnEscape: true, rows: 6 })
+      // What the call set out to do, in the model's own words for the person (never its code).
+      const title = oneLine((args as { title?: unknown }).title)
+      await update($, pending, () => (title === '' ? { app } : { app, title }))
+      await $.ui.open({ id: PANE, title: 'Codex computer use', focus: true, closeOnEscape: true, rows: 8 })
       return fail(
         `Codex needs the person's approval to use ${app}. They are being asked in the codex-cu prompt now. Stop and wait: a message will say whether they allowed it, and then you can retry the same call.`,
       )
@@ -212,30 +221,39 @@ export const register: Register = on => {
     const ask = await read($, pending)
     if (ask === null) return <Text dimColor>No approval waiting.</Text>
     const app = ask.app
+    const wants = ask.title === undefined ? '' : `Wants to: ${ask.title}`
+    const columns = e.props.bodyColumns
+    // The terminal draws a Button as `[ label ]` and never shows its hotkey; `plain` is the
+    // documented way to put the key on screen (`a: label`). A desktop draws a native button.
+    const keyed = e.surface === 'terminal' ? ({ plain: true } as const) : {}
 
     return (
-      <Box flexDirection="column">
-        <Text>Allow Codex computer use to use {app}?</Text>
-        <Text dimColor>It sends real clicks and keystrokes to the app in the background.</Text>
-        <Box>
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column">
+          <Text bold>Allow Codex to use {app}?</Text>
+          {wants !== '' && <Text wrap="truncate-end">{columns > 0 ? clip(wants, columns) : wants}</Text>}
+        </Box>
+        <Text dimColor>{`Codex clicks and types in ${app} in the background. Undo an always-allow with /codex-cu forget ${app}.`}</Text>
+        <Box gap={2} flexWrap="wrap">
           <Button
             key="allow"
-            label="This session"
+            label="Allow in this chat"
             hotkey="a"
             variant="primary"
             autoFocus
+            {...keyed}
             onPress={async () => {
               await update($, allowed, list => (list.includes(app) ? list : [...list, app]))
               await update($, pending, () => null)
               await $.ui.close({ id: PANE })
-              await $.prompt.submit({ text: `I allowed Codex computer use to use ${app} for this session. Retry the last call and continue the task.`, asUser: true })
+              await $.prompt.submit({ text: `I allowed Codex computer use to use ${app} for this chat. Retry the last call and continue the task.`, asUser: true })
             }}
           />
-          <Text> </Text>
           <Button
             key="always"
             label="Always allow"
             hotkey="l"
+            {...keyed}
             onPress={async () => {
               const always = await readAlways($, home)
               if (!always.includes(app)) await writeAlways($, home, [...always, app])
@@ -245,12 +263,12 @@ export const register: Register = on => {
               await $.prompt.submit({ text: `I always allowed Codex computer use to use ${app}. Retry the last call and continue the task.`, asUser: true })
             }}
           />
-          <Text> </Text>
           <Button
             key="deny"
             label="Deny"
             hotkey="d"
             role="dismiss"
+            {...keyed}
             onPress={async () => {
               await update($, pending, () => null)
               await $.ui.close({ id: PANE })

@@ -1,4 +1,4 @@
-export type CodexCuPending = { app: string } | null
+export type CodexCuPending = { app: string; title?: string } | null
 
 declare module 'claude-code' {
   interface PluginState {

@@ -8,7 +8,7 @@ No login data, API keys, cookies, personal home paths, saved app approvals, sess
 
 Computer Use can read an app's visible accessibility content, including content you did not ask it to quote. Start with clean apps. The bridge communicates with the locally installed runtime over a local Unix socket. This does not mean the whole AI task is offline; Claude and the connected services operate under their usual data terms.
 
-Fresh bridge settings contain `apps: []` and `autoApproveAll: false`. Allow this session, always allow and deny are separate choices. `/codex-cu auto on` broadens access across apps; it is not required for the demo. Turn it off with `/codex-cu auto off`. Clearing saved apps does not itself turn auto-approve off.
+Fresh bridge settings contain `apps: []` and `autoApproveAll: false`. Allow in this chat, always allow and deny are separate choices; `/codex-cu forget <app>` undoes an always-allow. `/codex-cu auto on` broadens access across apps; it is not required for the demo. Turn it off with `/codex-cu auto off`. Clearing saved apps does not itself turn auto-approve off.
 
 Threads saves its registry and events in `~/.claude/threads/`, plan records in its `plans/` directory, and handoff notes in the working project. Claude also maintains its usual session logs. Do not commit these into a shared project.
 

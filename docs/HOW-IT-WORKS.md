@@ -12,7 +12,7 @@ Three pieces make the connection usable:
 2. **The helper keeps the conversation open.** It runs in the background, carries tool requests, and answers app-approval questions using your choices. Each Claude caller gets its own connection. The helper also stops callers from competing over the same app while a lease is active.
 3. **The mod puts this inside Claude.** It adds the callable tool, the approval panel and `/codex-cu` commands. While on, it blocks Claude’s built-in desktop computer-use route. Purpose-built APIs, CLI tools and browser tools remain available.
 
-The first app request may ask you to allow the app for this session, always, or deny it. Saved choices belong to your machine. Auto-approve is a separate option, off in a fresh installation. A normal permission denial is not something the bridge should bypass.
+The first app request may ask you to allow the app in this chat, always allow it, or deny it. The prompt names what Codex wants to do when the call carries a title. Saved choices belong to your machine. Auto-approve is a separate option, off in a fresh installation. A normal permission denial is not something the bridge should bypass.
 
 ## Threads: one chat organizes separate sessions
 
