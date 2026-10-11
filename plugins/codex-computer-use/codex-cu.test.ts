@@ -159,6 +159,14 @@ test('a call that types before reading the state is refused; reading first, or n
   expect(typesUnread(undefined)).toBe(false)
 })
 
+test('a shortcut can move focus, so typing after it needs a fresh read', () => {
+  const opened = 'let app = await cua.getApp("TextEdit"); await app.pressKey("cmd+n");'
+  expect(typesUnread(`${opened} await app.typeText("hi")`)).toBe(true)
+  expect(typesUnread(`${opened} await app.getAXState({ emit: false }); await app.typeText("hi")`)).toBe(false)
+  expect(typesUnread('await app.getAXState(); await app.typeText("hi"); await app.pressKey("Return"); await app.typeText("more")')).toBe(false)
+  expect(typesUnread('await tab.getAXState(); await tab.pressKey(4, "ctrl+a"); await tab.typeText(4, "x")')).toBe(true)
+})
+
 test('the raw Codex tool is denied when it types unread', async ($, on) => {
   engine(on)
   await $.session.start(start)
