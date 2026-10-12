@@ -35,6 +35,13 @@ import {
   tidyFolder,
   tidyPath,
   tidyPaths,
+  shouldReport,
+  costText,
+  PRICES_AS_OF,
+  planRecord,
+  STUCK_MS,
+  versionAtLeast,
+  planStatusText as planStatusTextOf,
 } from "../hooks/core.mjs";
 
 const HOME = "/home/tester";
@@ -104,6 +111,9 @@ type World = {
   git?: (args: string[]) => { code?: number; stdout?: string; stderr?: string } | undefined;
   duringSpawn?: () => Promise<void>;
   store: Record<string, unknown>;
+  pluginList?: string; // what `claude plugin list --json` prints
+  tools?: Record<string, any>; // every tool the plugin registered, by name
+  cwdThrows?: boolean;
 };
 
 function fresh(over: Partial<World> = {}): World {
@@ -215,7 +225,10 @@ function sendKeys(w: World) {
 function engine(on: any, w: World) {
   on("session.start", ($: any, e: any) => ({ cwd: e.cwd }));
   on("command.register", ($: any, e: any) => ({ value: { command: e.name } }));
-  on("tool.register", ($: any, e: any) => ({ value: { tool: `mcp__threads__${e.name}` } }));
+  on("tool.register", ($: any, e: any) => {
+    (w.tools ??= {})[e.name] = e;
+    return { value: { tool: `mcp__threads__${e.name}` } };
+  });
   on("clock.now", () => ({ value: w.now }));
   on("clock.every", () => ({ value: undefined }));
   on("ui.log", () => ({ value: undefined }));
@@ -238,7 +251,10 @@ function engine(on: any, w: World) {
   on("session.receive", ($: any, e: any) => ({ text: e.text }));
   on("env.get", ($: any, e: any) => ({ value: e.name === "HOME" ? HOME : undefined }));
   on("session.id", () => ({ value: LEAD }));
-  on("session.cwd", () => ({ value: APP }));
+  on("session.cwd", () => {
+    if (w.cwdThrows) throw new Error("cwd is gone");
+    return { value: APP };
+  });
   on("tool.call", { tool: "AskUserQuestion" }, ($: any, e: any) => {
     const q = e.questions[0].question;
     w.asked.push(q);
@@ -351,6 +367,7 @@ function engine(on: any, w: World) {
     const ok = (stdout = "") => ({ value: { exitCode: 0, stdout, stderr: "", isStdoutTruncated: false, isStderrTruncated: false } });
     const fail = (stderr = "no", code = 1, stdout = "") => ({ value: { exitCode: code, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } });
     const [cmd] = argv;
+    if (cmd === "claude" && argv[1] === "plugin") return ok(w.pluginList ?? "[]");
     if (cmd === "claude") {
       w.authCalls++;
       const out = JSON.stringify({ loggedIn: w.loggedIn, authMethod: w.loggedIn ? "claude.ai" : "none" });
@@ -411,7 +428,9 @@ function engine(on: any, w: World) {
           if (w.register) {
             const sid = argv[argv.indexOf("--session-id") + 1];
             const title = argv[argv.indexOf("-n") + 1];
-            const cwd = args[args.indexOf("-c") + 1];
+            // Claude Code runs a --worktree session inside the worktree it made
+            const wtName = argv.includes("--worktree") ? argv[argv.indexOf("--worktree") + 1] : "";
+            const cwd = wtName ? `${args[args.indexOf("-c") + 1]}/.claude/worktrees/${wtName}` : args[args.indexOf("-c") + 1];
             w.fs.set(
               `${CFG}/sessions/${pid}.json`,
               JSON.stringify({ pid, sessionId: sid, cwd, name: title, status: "busy", messagingSocketPath: `/tmp/cc-socks/${pid}.sock` }),
@@ -571,7 +590,10 @@ describe("threads: creating", () => {
     expect(out).toMatch(/^Created Thread \| Haiku scout \(t[0-9a-f]{5}\) on haiku in \/work\/app as its own Claude Code session, permission mode acceptEdits\./);
     expect(out).toMatch(/Backend: auto picked a session because the terminal login works\./);
     expect(out).toMatch(/It is running\./);
-    expect(out).toMatch(/report back here/);
+    // the sidebar is promised only with a Remote Control link; reports come from the watcher, not the helper
+    expect(out).toMatch(/No Remote Control link seen yet, so it is not in the desktop sidebar yet/);
+    expect(out).toMatch(/the watcher reads its transcript and puts its final answer here/);
+    expect(out).not.toMatch(/message a short report back/);
     const [argv] = spawns(w);
     const t = created(w, "Haiku scout");
     expect(argv.slice(0, 15)).toEqual(["tmux", "-L", "cc-threads", "-f", "/dev/null", "new-session", "-d", "-s", `thread-${t.id}`, "-x", "200", "-y", "50", "-c", APP]);
@@ -605,7 +627,7 @@ describe("threads: creating", () => {
     await boot($, on, w);
     const out = await threads($, "new haiku Scout --session -- list files");
     expect(out).toMatch(/^Not created\. Threads need the terminal Claude Code login\. Run `claude auth login` in Terminal once\./);
-    expect(out).toMatch(/Or use an inline thread/);
+    expect(out).toMatch(/never switch to an inline thread on their own\. If the person asks for one, backend: "inline"/);
     expect(spawns(w)).toHaveLength(0);
     await threads($, "new haiku Scout --session -- list files");
     expect(w.authCalls).toBe(1);
@@ -728,23 +750,28 @@ describe("threads: steering", () => {
     expect(await threads($, "send haiku x")).toMatch(/Not delivered to Haiku scout .*session is not running/);
   });
 
-  test("a refused message to a live session thread is typed into its prompt; long text goes through a file", async ($, on) => {
+  test("a refused message is reported, never typed around; only force (the person asked) types it; long text goes through a file", async ($, on) => {
     const w = fresh();
     const { scout } = await two($, on, w);
     w.deliver = "The server-side auto mode classifier gave no verdict for SendMessage";
-    expect(await threads($, "send haiku add an empty-string test")).toMatch(/^Sent to Haiku scout .* by typing it into its prompt \(the message channel refused: The server-side auto mode/);
+    expect(await threads($, "send haiku add an empty-string test")).toMatch(/^Not delivered to Haiku scout \(t[0-9a-f]+\): The server-side auto mode classifier/);
+    const refused: any = await $.tool.call({ tool: "mcp__threads__threads_send", id: "haiku", message: "add an empty-string test" } as any);
+    expect(refused.result).toMatch(/^Not delivered to Haiku scout/);
+    expect(sendKeys(w)).toHaveLength(0);
+    const forced: any = await $.tool.call({ tool: "mcp__threads__threads_send", id: "haiku", message: "add an empty-string test", force: true } as any);
+    expect(forced.result).toMatch(/^Sent to Haiku scout .* by typing it into its prompt, as asked \(the message channel refused: The server-side auto mode/);
     expect(sendKeys(w)).toEqual([
       ["send-keys", "-t", scout.tmux, "-l", "Message from your lead chat: add an empty-string test"],
       ["send-keys", "-t", scout.tmux, "C-m"],
     ]);
     const long = `line one\n${"x".repeat(700)}`;
-    expect(await threads($, `send haiku ${long}`)).toMatch(/by typing it into its prompt/);
+    expect(((await $.tool.call({ tool: "mcp__threads__threads_send", id: "haiku", message: long, force: true } as any)) as any).result).toMatch(/by typing it into its prompt/);
     const typed = sendKeys(w)[2];
     expect(typed[4]).toMatch(/^Message from your lead chat: read .*\/inbox\/t[0-9a-f]+-\d+\.md and follow it\.$/);
     expect(events(w).filter((e: any) => e.type === "typed-fallback")).toHaveLength(2);
-    // a permission dialog on screen is never typed over
+    // a permission dialog on screen is never typed over, forced or not
     w.tmux.get(scout.tmux)!.screen = PERMISSION_SCREEN;
-    expect(await threads($, "send haiku x")).toMatch(/^Not delivered to Haiku scout/);
+    expect(((await $.tool.call({ tool: "mcp__threads__threads_send", id: "haiku", message: "x", force: true } as any)) as any).result).toMatch(/^Not delivered to Haiku scout/);
     expect(sendKeys(w)).toHaveLength(4);
   });
 
@@ -1098,12 +1125,21 @@ async function finish($: any, w: World, agentId: string, answer: string) {
 }
 
 describe("threads: inline backend", () => {
-  test("auto picks inline when the CLI is logged out; spawn args and registry fields", async ($, on) => {
+  test("auto never switches to inline when the CLI is logged out; an explicit inline request works: spawn args and registry fields", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    const out = await threads($, "new haiku Haiku scout -- list the files here");
+    const refused = await threads($, "new haiku Haiku scout -- list the files here");
+    expect(refused).toMatch(/^Not created\. Threads need the terminal Claude Code login\. Run `claude auth login` in Terminal once\./);
+    expect(refused).toMatch(/never switch to an inline thread on their own\. If the person asks for one, backend: "inline"/);
+    const viaTool: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Auto", task: "x" } as any);
+    expect(viaTool.deny).toMatch(/claude auth login[\s\S]*backend: "inline"/);
+    const plan: any = await $.tool.call({ tool: "mcp__threads__threads_plan", title: "P", phases: [{ name: "A", model: "haiku", task: "t" }] } as any);
+    expect(plan.deny).toMatch(/claude auth login[\s\S]*never switch to inline threads on their own/);
+    expect(w.spawned).toHaveLength(0);
+    expect(registry(w).threads).toHaveLength(0);
+    const out = await threads($, "new haiku Haiku scout --inline -- list the files here");
     expect(out).toMatch(/^Created Thread \| Haiku scout \(t[0-9a-f]{5}\) inline on haiku as a background agent of this chat \(agent agent-1\)\./);
-    expect(out).toMatch(/Backend: auto picked inline because the terminal CLI is not logged in\./);
+    expect(out).not.toMatch(/auto picked/);
     expect(spawns(w)).toHaveLength(0);
     const t = created(w, "Haiku scout");
     expect(w.spawned).toHaveLength(1);
@@ -1136,7 +1172,7 @@ describe("threads: inline backend", () => {
   test("activity by agentId: tool calls, model steps, a permission ask, the final answer as the report", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     const t = created(w, "Haiku scout");
     await $.tool.call({ tool: "Read", file_path: "/work/app/README.md", agentId: "agent-1", tool_use_id: "tu1" } as any);
     await $.tool.call({ tool: "Read", file_path: "/elsewhere", agentId: "agent-99", tool_use_id: "tu2" } as any); // not a thread
@@ -1180,7 +1216,7 @@ describe("threads: inline backend", () => {
   test("steer by agentId, type becomes a message, model/approve refuse, interrupt and close use TaskStop", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     const t = created(w, "Haiku scout");
     expect(await threads($, "send haiku also count lines")).toMatch(/^Sent to Haiku scout/);
     expect(w.sent).toEqual([{ to: "agent-1", text: "also count lines" }]);
@@ -1226,7 +1262,7 @@ describe("threads: inline backend", () => {
   test("threads_wait returns when an inline thread finishes, with its report", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     const t = created(w, "Haiku scout");
     w.onSleepAsync = async (_eng, world, n) => {
       world.now += 3000;
@@ -1243,7 +1279,7 @@ describe("threads: inline backend", () => {
     test(`pane shows an inline thread's transcript and live activity on ${surface}`, async ($, on) => {
       const w = fresh({ loggedIn: false });
       await boot($, on, w);
-      await threads($, "new haiku Haiku scout -- list the files");
+      await threads($, "new haiku Haiku scout --inline -- list the files");
       const t = created(w, "Haiku scout");
       w.agentMessages["agent-1"] = [
         { role: "user", text: "list the files", toolUses: [] },
@@ -1377,7 +1413,7 @@ const HELD = (body: string) =>
   ["╭ Held message from another session ─╮", "│ Another Claude session sent a message: from Lead chat │", "│ Message body (this is what will be delivered): │", `│ ${body} │`, "│ ❯ 1. Deny │", "│   2. Deliver this message to Claude │", "╰──╯"].join("\n");
 
 describe("threads: held messages", () => {
-  test("a held copy of the message we sent is delivered with Down then Enter", async ($, on) => {
+  test("a held copy of our message waits for the person: no keys from send or the watcher; the pane's button delivers it", async ($, on) => {
     const w = fresh();
     await boot($, on, w);
     await threads($, "new haiku Haiku scout -- list");
@@ -1387,12 +1423,27 @@ describe("threads: held messages", () => {
     };
     w.tmux.get(t.tmux)!.screen = "";
     const out = await threads($, "send haiku Lead here: also count the lines");
-    expect(out).toMatch(/it was held by that session; delivered it/);
+    expect(out).toMatch(/that session holds it for approval \(status held-message\)\. The person approves it: in that thread \(Open\), or with Deliver held message/);
+    await threads($, "refresh"); // the watcher sees it held and leaves it
+    expect(sendKeys(w)).toHaveLength(0);
+    expect(created(w, "Haiku scout").status).toBe("held-message");
+    expect(await threads($, "list")).toMatch(/held: a message waits for the person's approval \(Lead here: also count the lines\)/);
+    await threads($, "");
+    for (const surface of ["terminal", "desktop"]) {
+      const ui = await $.ui.mount({ plugin: "threads", surface, component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
+      expect(await ui.find({ type: "Text", text: /^held message from another session: Lead here: also count the lines\. Approving it is yours/ })).toBeDefined();
+      expect(await ui.find({ type: "Button", key: "approve" })).toBeUndefined();
+      await ui.unmount();
+    }
+    // the person presses Deliver held message: Down to Deliver, then Enter
+    const ui = await $.ui.mount({ plugin: "threads", surface: "desktop", component: "Pane", requestId: "threads", props: PANE_PROPS } as any);
+    await ui.press({ key: "deliver-held" });
+    await ui.unmount();
     expect(sendKeys(w)).toEqual([
       ["send-keys", "-t", t.tmux, "Down"],
       ["send-keys", "-t", t.tmux, "C-m"],
     ]);
-    expect(events(w).map((e: any) => e.type)).toContain("held-delivered");
+    expect(events(w).find((e: any) => e.type === "held-delivered")).toMatchObject({ by: "person" });
   });
 
   test("a held message we did not send is left alone and shows as held-message", async ($, on) => {
@@ -1457,7 +1508,7 @@ describe("threads: effort", () => {
   test("inline threads carry their effort on each request through turn.step", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await $.tool.call({ tool: "mcp__threads__threads_create", model: "sonnet", title: "Fixer", task: "fix", effort: "high" } as any);
+    await $.tool.call({ tool: "mcp__threads__threads_create", backend: "inline", model: "sonnet", title: "Fixer", task: "fix", effort: "high" } as any);
     await drainStep($, "agent-1");
     await drainStep($, "agent-99"); // not a thread: untouched
     expect(w.stepEfforts).toEqual(["high", undefined]);
@@ -1621,7 +1672,7 @@ describe("threads: plans end to end (stubbed engine)", () => {
   test("lead gate (inline): asks the lead with a note and a wake, revise reaches the same thread, approve starts phase 2", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    const r: any = await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "lead", phases: PHASES } as any);
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_plan", backend: "inline", title: "Demo", gate: "lead", phases: PHASES } as any);
     expect(r.result).toMatch(/inline threads, gate lead/);
     const planId = registry(w).plans[0].id;
     const [p1] = phaseThreads(w);
@@ -1766,7 +1817,7 @@ describe("threads: plan cleanup, cap and stale wakes", () => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
     await $.turn.start({ text: "busy lead", turnId: "lead-1" } as any); // the lead is mid-turn
-    await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "lead", phases: PHASES } as any);
+    await $.tool.call({ tool: "mcp__threads__threads_plan", backend: "inline", title: "Demo", gate: "lead", phases: PHASES } as any);
     const planId = registry(w).plans[0].id;
     w.fs.set(phaseThreads(w)[0].handoffPath, "# handoff");
     await finish($, w, "agent-1", "Ideas written.");
@@ -1791,7 +1842,7 @@ describe("threads: plan cleanup, cap and stale wakes", () => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
     await $.turn.start({ text: "busy lead", turnId: "lead-1" } as any);
-    await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "lead", phases: PHASES } as any);
+    await $.tool.call({ tool: "mcp__threads__threads_plan", backend: "inline", title: "Demo", gate: "lead", phases: PHASES } as any);
     const planId = registry(w).plans[0].id;
     w.fs.set(phaseThreads(w)[0].handoffPath, "# handoff");
     await finish($, w, "agent-1", "Ideas written.");
@@ -2038,7 +2089,8 @@ describe("threads: cost", () => {
     await threads($, "new haiku Inline --inline -- y");
     await drainStep($, "agent-1"); // usage 1 in + 1 out on haiku
     await threads($, "list");
-    expect(registry(w2).threads.find((x: any) => x.title === "Thread | Inline").costUsd).toBeUndefined(); // below the half-tenth-of-a-cent write threshold
+    // its first figure is written however small (unknown and $0 differ); later changes below half a tenth of a cent are not
+    expect(registry(w2).threads.find((x: any) => x.title === "Thread | Inline").costUsd).toBe(0.00001);
   });
 });
 
@@ -2112,7 +2164,7 @@ describe("threads: fork", () => {
     await boot($, on, w);
     await $.tool.call({ tool: "mcp__threads__threads_fork", title: "Fallback", task: "t", model: "haiku" } as any);
     const brief = spawns(w)[0][spawns(w)[0].indexOf("--append-system-prompt") + 1];
-    expect(brief).toMatch(/Outline of the lead conversation, oldest first:\n#1 user: Fix the login bug in auth\.ts/);
+    expect(brief).toMatch(/An outline of this chat \(summary unavailable\), oldest first:\n#1 user: Fix the login bug in auth\.ts/);
     const r: any = await $.tool.call({ tool: "mcp__threads__threads_fork", title: "Full", task: "t", model: "haiku", include: "full" } as any);
     const file = created(w, "Full").forkedFrom.file;
     expect(file).toMatch(/^\/home\/tester\/\.claude\/threads\/forks\/fork-[0-9a-f]+\.md$/);
@@ -2184,7 +2236,7 @@ describe("threads: plan history", () => {
   test("the record's markdown lists decisions with feedback", () => {
     const md = planRecordMarkdown({ id: "p1", title: "T", cwd: "/r", gate: "lead", backend: "session", lead: { title: "L", sessionId: "s" }, status: "done", createdAt: 1, durationMs: 120000, costUsd: 0.5, phases: [], history: [{ at: 2, event: "decision", phase: 1, decision: "revise", feedback: "more tests", then: ["revise"] }] } as any);
     expect(md).toMatch(/phase 01 decision revise \("more tests"\) -> revise/);
-    expect(md).toMatch(/est\. API-equivalent \$0\.500/);
+    expect(md).toMatch(/\$0\.500 est\. API-equivalent, list prices as recorded 2026-10-12, not your bill/);
   });
 });
 
@@ -2283,12 +2335,14 @@ describe("threads: plan history backfill", () => {
 // ---- worktrees, rename, unread, handoff ---------------------------------------------------
 
 // a repo at APP: HEAD abc123, and per-worktree status and commit counts the test sets
-function gitRepo(w: World, state: { porcelain?: string; commits?: string } = {}) {
+function gitRepo(w: World, state: { porcelain?: string; commits?: string; head?: string } = {}) {
   const calls: string[][] = [];
   w.git = (args) => {
     calls.push(args);
     const sub = args.slice(2);
     if (sub[0] === "rev-parse" && sub[1] === "--show-toplevel") return { stdout: `${APP}\n` };
+    // a --worktree checkout is on worktree-<its folder name>, unless the test says otherwise
+    if (sub[0] === "rev-parse" && sub[1] === "--abbrev-ref") return { stdout: `${state.head ?? `worktree-${args[1].split("/").pop()}`}\n` };
     if (sub[0] === "rev-parse" && sub[1] === "HEAD") return { stdout: "abc123\n" };
     if (sub[0] === "status") return { stdout: state.porcelain ?? "" };
     if (sub[0] === "rev-list") return { stdout: `${state.commits ?? "0"}\n` };
@@ -2316,7 +2370,9 @@ describe("threads: worktrees", () => {
     await boot($, on, w);
     const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Iso", task: "edit things", worktree: true } as any);
     expect(r.result).toMatch(/its own git worktree on branch worktree-threads-t[0-9a-f]+/);
+    expect(r.result).toMatch(/never edits the same working files as other threads \(merging can still conflict\)/);
     const t = created(w, "Iso");
+    expect(r.result).toContain(`Verified: branch worktree-threads-${t.id}, session folder ${APP}/.claude/worktrees/threads-${t.id}.`);
     const argv = spawns(w)[0];
     expect(argv[argv.indexOf("--worktree") + 1]).toBe(`threads-${t.id}`);
     // launched from the trusted repo folder, filed under the worktree it runs in
@@ -2335,7 +2391,7 @@ describe("threads: worktrees", () => {
     expect(created(w, "Iso").worktree.removed).toBe(true);
   });
 
-  test("a worktree with commits or edits is kept, with the merge command", async ($, on) => {
+  test("a worktree with commits and edits is kept: the merge command for the commits, the edits listed for review", async ($, on) => {
     const w = fresh();
     gitRepo(w, { commits: "2", porcelain: " M src/a.ts\n" });
     await boot($, on, w);
@@ -2343,9 +2399,37 @@ describe("threads: worktrees", () => {
     const t = created(w, "Builder");
     w.dirs.set(t.worktree.path, t.worktree.path);
     const out = await threads($, `close ${t.id}`);
-    expect(out).toMatch(new RegExp(`kept at .*threads-${t.id} on branch worktree-threads-${t.id} \\(2 commits and uncommitted changes\\)\\. Merge it with: git -C '${APP}' merge worktree-threads-${t.id}`));
+    expect(out).toMatch(new RegExp(`kept at .*threads-${t.id} on branch worktree-threads-${t.id}\\. 2 commits ahead; merge with: git -C '${APP}' merge worktree-threads-${t.id}`));
+    expect(out).toContain(`Uncommitted changes in ${t.worktree.path} need review and a commit first:\n   M src/a.ts`);
     expect(w.runs.some((a) => a[0] === "git" && a.includes("remove"))).toBe(false);
     expect(created(w, "Builder").worktree).toMatchObject({ kept: true, commits: 2, dirty: true });
+  });
+
+  test("a worktree with only uncommitted edits is kept with no merge command, at most five status lines", async ($, on) => {
+    const w = fresh();
+    gitRepo(w, { commits: "0", porcelain: ["a", "b", "c", "d", "e", "f", "g"].map((x) => ` M ${x}.ts`).join("\n") });
+    await boot($, on, w);
+    await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Dirty", task: "edit", worktree: true } as any);
+    const t = created(w, "Dirty");
+    w.dirs.set(t.worktree.path, t.worktree.path);
+    const out = await threads($, `close ${t.id}`);
+    expect(out).not.toMatch(/merge/);
+    expect(out).toContain(`Uncommitted changes in ${t.worktree.path} need review and a commit first:\n   M a.ts\n   M b.ts\n   M c.ts\n   M d.ts\n   M e.ts\n  … and 2 more`);
+    expect(w.runs.some((a) => a[0] === "git" && (a.includes("remove") || a.includes("-D")))).toBe(false);
+  });
+
+  test("a worktree thread on the wrong branch is reported, the real values saved, and never cleaned up", async ($, on) => {
+    const w = fresh();
+    gitRepo(w, { head: "main" });
+    await boot($, on, w);
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Off", task: "x", worktree: true } as any);
+    const t = created(w, "Off");
+    expect(r.result).toContain(`Worktree check failed: branch is main, not worktree-threads-${t.id}.`);
+    expect(t.worktree).toMatchObject({ branch: `worktree-threads-${t.id}`, actual: { branch: "main", cwd: `${APP}/.claude/worktrees/threads-${t.id}` } });
+    w.dirs.set(t.worktree.path, t.worktree.path);
+    const out = await threads($, `close ${t.id}`);
+    expect(out).toMatch(/did not match what was set up \(branch is main/);
+    expect(w.runs.some((a) => a[0] === "git" && (a.includes("remove") || a.includes("-D")))).toBe(false);
   });
 
   test("outside a git repo a worktree thread is refused", async ($, on) => {
@@ -2359,7 +2443,7 @@ describe("threads: worktrees", () => {
     const w2 = fresh({ loggedIn: false });
     const calls = gitRepo(w2);
     await boot($, on, w2);
-    const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Inl", task: "y", worktree: true } as any);
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", backend: "inline", model: "haiku", title: "Inl", task: "y", worktree: true } as any);
     expect(r.result).toMatch(/own git worktree/);
     const t = created(w2, "Inl");
     expect(calls.some((a) => a.slice(2).join(" ") === `worktree add -b worktree-threads-${t.id} ${APP}/.claude/worktrees/threads-${t.id} abc123`)).toBe(true);
@@ -2428,7 +2512,7 @@ describe("threads: rename, unread, handoff, first-request effort", () => {
       await drainStep($, "agent-1");
     };
     await boot($, on, w);
-    await $.tool.call({ tool: "mcp__threads__threads_create", model: "sonnet", title: "Early", task: "go", effort: "low" } as any);
+    await $.tool.call({ tool: "mcp__threads__threads_create", backend: "inline", model: "sonnet", title: "Early", task: "go", effort: "low" } as any);
     expect(w.stepEfforts[0]).toBe("low");
   });
 });
@@ -2581,7 +2665,7 @@ describe("threads: pane polish", () => {
     });
 
     test("tidyPath: home is ~, a long path loses its middle but keeps its last two segments", () => {
-      expect(tidyPath("/Users/dawizkidmal/proj/a.ts", 40, "/Users/dawizkidmal")).toBe("~/proj/a.ts");
+      expect(tidyPath("/home/tester/proj/a.ts", 40, "/home/tester")).toBe("~/proj/a.ts");
       expect(tidyPath("/home/tester/proj", 40, "/home/tester")).toBe("~/proj");
       expect(tidyPath("/work/app", 40, "/home/tester")).toBe("/work/app");
       const long = "/Users/me/.claude/local-marketplaces/claude-mods/plugins/threads/hooks/threads.mjs";
@@ -2611,7 +2695,7 @@ describe("threads: pane polish", () => {
     });
 
     test("home: only the real home becomes ~; a path that merely looks like one is left alone", () => {
-      const home = "/Users/dawizkidmal";
+      const home = "/home/tester";
       expect(homePath(home, home)).toBe("~");
       expect(homePath(`${home}/work/app`, home)).toBe("~/work/app");
       expect(homePath(`${home}/`, home)).toBe("~/");
@@ -2626,7 +2710,7 @@ describe("threads: pane polish", () => {
       expect(homePath(`${home}/a`, "")).toBe(`${home}/a`);
       expect(homePath(`${home}/a`)).toBe(`${home}/a`);
       // inside a line, the same rule for each path
-      const line = "GET /Users/42 read /Users/Shared/data/file.txt and /home/dashboard but not ours at /Users/dawizkidmal/proj/a.ts or /Users/dawizkidmal";
+      const line = "GET /Users/42 read /Users/Shared/data/file.txt and /home/dashboard but not ours at /home/tester/proj/a.ts or /home/tester";
       expect(tidyPaths(line, Infinity, home)).toBe("GET /Users/42 read /Users/Shared/data/file.txt and /home/dashboard but not ours at ~/proj/a.ts or ~");
       expect(tidyPath("/Users/Shared/data/file.txt", 80, home)).toBe("/Users/Shared/data/file.txt");
     });
@@ -2836,12 +2920,13 @@ describe("threads: pane polish", () => {
     }
   });
 
-  test("a thread with no spend shows $0, and the header leaves the total out", async ($, on) => {
+  test("a thread with no cost figure yet shows cost unavailable, never $0, and the header leaves the total out", async ($, on) => {
     const { scout } = await paneWorld($, on);
     for (const surface of SURFACES) {
       const ui = await mountPane($, surface);
       await ui.press({ key: `sel:${scout.id}` });
-      expect(await ui.find({ type: "Text", text: /^\$0 est\. API-equivalent/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^cost unavailable est\. API-equivalent, list prices as recorded/ })).toBeDefined();
+      expect(await ui.find({ type: "Text", text: /^\$0 est\./ })).toBeUndefined();
       expect(await ui.find({ type: "Text", text: /est\. · updated/ })).toBeUndefined();
       await ui.unmount();
     }
@@ -3125,7 +3210,7 @@ describe("threads: pane polish", () => {
   test("an inline thread's folder and agent fold into the stacked status line too", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     await threads($, "");
     const ui = await mountPane($, "terminal", 80);
     expect(await ui.find({ type: "Text", text: "Folder" })).toBeUndefined();
@@ -3175,7 +3260,7 @@ describe("threads: pane polish", () => {
   test("an inline thread's stacked status line budgets the folder around the agent id and never cuts the id", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     const reg = registry(w);
     for (const t of reg.threads) Object.assign(t, { cwd: LONG_CWD, permissionMode: "bypassPermissions" });
     w.fs.set(REG, JSON.stringify(reg));
@@ -3214,7 +3299,7 @@ describe("threads: pane polish", () => {
   test("a wide pane's Folder row for an inline thread keeps the agent id whole: beside the folder when both fit, on its own row when not", async ($, on) => {
     const w = fresh({ loggedIn: false });
     await boot($, on, w);
-    await threads($, "new haiku Haiku scout -- list the files");
+    await threads($, "new haiku Haiku scout --inline -- list the files");
     const reg = registry(w);
     for (const t of reg.threads) Object.assign(t, { cwd: LONG_CWD, permissionMode: "bypassPermissions" });
     w.fs.set(REG, JSON.stringify(reg));
@@ -3390,5 +3475,196 @@ describe("threads: pane polish", () => {
       expect((await ui.find({ key: "close-pane" }))?.props.hotkey).toBe("c");
       await ui.unmount();
     }
+  });
+});
+
+// ---- the audit's fixes -------------------------------------------------------------------------
+
+describe("threads: audit fixes", () => {
+  const planThreads = (w: World) => registry(w).threads.filter((t: any) => t.planId);
+  const answerAt = (text: string, at: number, uuid = "a1") =>
+    JSON.stringify({ type: "assistant", uuid, timestamp: new Date(at).toISOString(), message: { role: "assistant", model: "claude-haiku-4-5-20251001", content: [{ type: "text", text }] } });
+
+  test("stepPlan: interrupted marks the running phase and the plan interrupted, never done; retry starts it again", () => {
+    const v: any = validatePlan({ title: "Demo", gate: "auto", phases: PHASES });
+    let plan: any = { id: "pabcde", cwd: "/r", handoffDir: "/r/handoff", backend: "session", lead: { sessionId: LEAD, title: "Lead" }, status: "running", current: 0, ...v };
+    plan = stepPlan(plan, { type: "started", index: 0, threadId: "t1", handoffPath: "/r/h1.md", at: 1 }).plan;
+    const out = stepPlan(plan, { type: "interrupted", index: 0, reason: "its helper exited", at: 2 });
+    expect(out.plan.phases[0]).toMatchObject({ status: "interrupted", endedAt: 2 });
+    expect(out.plan.status).toBe("interrupted");
+    expect(out.actions.map((a: any) => a.type)).toEqual(["interrupted"]);
+    expect(out.plan.history.at(-1)).toMatchObject({ event: "interrupted", reason: "its helper exited" });
+    // a later finished event cannot complete it, and a phase that is not running ignores interrupted
+    expect(stepPlan(out.plan, { type: "finished", index: 0, hasHandoff: true }).plan.phases[0].status).toBe("interrupted");
+    expect(stepPlan(plan, { type: "interrupted", index: 1 }).actions[0].type).toBe("ignored");
+    expect(planStatusTextOf(out.plan)).toMatch(/! 01 Notes · haiku\/low · interrupted/);
+    const again = stepPlan(out.plan, { type: "retry", index: 0 });
+    expect(again.plan.status).toBe("running");
+    expect(again.actions[0]).toMatchObject({ type: "start", index: 0 });
+  });
+
+  test("a phase helper that exits with no new answer interrupts the plan; the next phase never starts; the record says so", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "auto", phases: PHASES } as any);
+    const [p1] = planThreads(w);
+    await threads($, "refresh");
+    w.tmux.delete(p1.tmux); // crashed or killed
+    await threads($, "refresh");
+    const plan = registry(w).plans[0];
+    expect(plan.status).toBe("interrupted");
+    expect(plan.phases[0].status).toBe("interrupted");
+    expect(spawns(w)).toHaveLength(1);
+    const record = JSON.parse(w.fs.get(`${CFG}/threads/plans/${plan.id}.json`)!);
+    expect(record).toMatchObject({ version: 1, status: "interrupted" });
+    expect(record.phases[0].status).toBe("interrupted");
+    expect(w.fs.get(`${CFG}/threads/plans/${plan.id}.md`)).toMatch(/phase 01 interrupted \(its helper exited before a new final answer\) -> interrupted/);
+    expect(w.toasts.some((x) => /Plan Demo interrupted at phase 01/.test(x))).toBe(true);
+    expect(await threads($, "plan status")).toMatch(/Plan Demo \(p[0-9a-f]+\) · interrupted[\s\S]*! 01 Notes/);
+  });
+
+  test("closing a running phase helper interrupts its phase", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    await $.tool.call({ tool: "mcp__threads__threads_plan", title: "Demo", gate: "auto", phases: PHASES } as any);
+    const [p1] = planThreads(w);
+    await $.tool.call({ tool: "mcp__threads__threads_close", id: p1.id, confirmed: true } as any);
+    const plan = registry(w).plans[0];
+    expect(plan.phases[0]).toMatchObject({ status: "interrupted", note: "interrupted: closed while it ran" });
+    expect(plan.status).toBe("interrupted");
+  });
+
+  test("shouldReport: only a peer note that says the same thing, or came after the answer, stands in for it", () => {
+    const peer = (text: string, at: number) => ({ lastReport: { at, text, source: "peer" }, appendedKey: "", key: "k1", now: 10000 });
+    expect(shouldReport({ ...peer("Halfway: reading files", 1000), answer: "Done: 3 files.", answerAt: 5000 })).toEqual({ report: true });
+    expect(shouldReport({ ...peer("Done: 3 files.", 1000), answer: "done:  3 files.", answerAt: 5000 }).report).toBe(false);
+    expect(shouldReport({ ...peer("Wrapping up", 6000), answer: "Done: 3 files.", answerAt: 5000 }).report).toBe(false);
+    expect(shouldReport({ lastReport: null, appendedKey: "k1", key: "k1", now: 1 }).report).toBe(false);
+  });
+
+  test("a mid-task peer note does not swallow the final answer", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- list");
+    const t = created(w, "Haiku scout");
+    await threads($, "refresh");
+    w.now = T0 + 1000;
+    await $.session.receive({ origin: { kind: "peer" }, text: `<cross-session-message from="uds:/tmp/cc-socks/${t.pid}.sock" from-name="${t.title}">Halfway: reading files.</cross-session-message>` } as any);
+    w.now = T0 + 8000;
+    setSession(w, t.sessionId, { status: "idle" });
+    w.fs.set(transcriptPath(APP, t.sessionId), [userRow("go"), answerAt("Done: 3 files.", T0 + 5000)].join("\n"));
+    await threads($, "refresh");
+    expect(appendedRows(w)).toHaveLength(1);
+    expect(appendedRows(w)[0]).toMatch(/Done: 3 files\./);
+    expect(created(w, "Haiku scout").lastReport).toMatchObject({ source: "watcher", text: "Done: 3 files." });
+  });
+
+  test("cost: unknown is cost unavailable, unpriced usage is a floor, the price table is dated", async ($, on) => {
+    expect(PRICES_AS_OF).toBe("2026-10-12");
+    expect(costText(undefined)).toBe("cost unavailable");
+    expect(costText(0)).toBe("$0");
+    expect(costText(0.5, 1)).toBe("≥ $0.500, some usage unpriced");
+    expect(costText(0, 2)).toBe("cost unavailable");
+    expect(costFromTranscript([usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 1000, output_tokens: 0 }), usageRow("m2", "claude-zeta-1", { input_tokens: 1000, output_tokens: 0 })].join("\n"))).toMatchObject({ unpriced: 1 });
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- x");
+    const t = created(w, "Haiku scout");
+    expect(await threads($, "list")).toMatch(/haiku \(unverified\) · cost unavailable/);
+    w.fs.set(transcriptPath(APP, t.sessionId), [usageRow("m1", "claude-haiku-4-5-20251001", { input_tokens: 1000000, output_tokens: 0 }), usageRow("m2", "claude-zeta-1", { input_tokens: 10, output_tokens: 0 })].join("\n"));
+    const list = await threads($, "list");
+    expect(list).toMatch(/≥ \$1\.000, some usage unpriced est\./);
+    expect(list).toMatch(/This chat's threads: ≥ \$1\.000, some usage unpriced est\. API-equivalent, list prices as recorded 2026-10-12, not your bill\./);
+    expect(created(w, "Haiku scout")).toMatchObject({ costUsd: 1, costUnpriced: 1 });
+  });
+
+  test("a plan record is versioned and shows an unknown phase cost as unavailable, not $0", () => {
+    const v: any = validatePlan({ title: "Demo", gate: "auto", phases: PHASES });
+    const plan: any = { id: "p1", title: "Demo", cwd: "/r", handoffDir: "/r/handoff", backend: "session", lead: { sessionId: LEAD, title: "Lead" }, status: "running", current: 0, createdAt: 1, ...v };
+    plan.phases[0].threadId = "t1";
+    const rec: any = planRecord(plan, new Map([["t1", { id: "t1", title: "T" }]]), 2);
+    expect(rec.version).toBe(1);
+    expect(rec.costUnpriced).toBe(1); // phase 01's thread has no figure yet
+    const md = planRecordMarkdown(rec);
+    expect(md).toMatch(/cost unavailable est\. API-equivalent, list prices as recorded 2026-10-12, not your bill/);
+    expect(md).toMatch(/\| 01 \| Notes \|.*\| cost unavailable \|/);
+    expect(md).toMatch(/\| 02 \| Apply \|.*\| \$0 \|/);
+  });
+
+  test("a registry from a newer mod is read, never rewritten, and nothing new starts", async ($, on) => {
+    const newer = JSON.stringify({ version: 2, cap: 4, threads: [], plans: [], future: { x: 1 } });
+    expect(parseRegistry(newer)).toMatchObject({ isReadOnly: true, isCorrupt: false, registry: { version: 2, future: { x: 1 } } });
+    expect(parseRegistry(JSON.stringify({ version: 1, threads: [] })).isReadOnly).toBe(false);
+    const w = fresh();
+    w.fs.set(REG, newer);
+    await boot($, on, w);
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "X", task: "y" } as any);
+    expect(r.deny).toMatch(/registry is format 2, newer than this mod understands \(1\), so it is read-only here and nothing was started/);
+    expect(spawns(w)).toHaveLength(0);
+    await threads($, "cap 3");
+    expect(w.fs.get(REG)).toBe(newer);
+    expect(w.toasts.filter((x) => /registry is format 2/.test(x))).toHaveLength(1);
+  });
+
+  test("stuck: busy with no new transcript row for 10 minutes; counted in the band and listed", async ($, on) => {
+    const busy = { previous: "working", tmux: { isLive: true, isDead: false }, session: { status: "busy" }, pidAlive: true, screen: readScreen(""), now: T0 + STUCK_MS, createdAt: T0 };
+    expect(statusOf({ ...busy, lastAt: T0 })).toBe("stuck");
+    expect(statusOf({ ...busy, lastAt: T0 + 1 })).toBe("working");
+    expect(statusOf({ ...busy, lastAt: 0 })).toBe("working"); // no transcript time: not judged
+    expect(statusOf({ ...busy, session: { status: "idle" }, lastAt: T0 })).toBe("idle");
+    expect(bandText([{ status: "stuck" }, { status: "working" }, { status: "needs-you" }] as any)).toBe("⇶ 3 threads · 1 working · 1 stuck · 1 needs you · /threads");
+    const w = fresh();
+    await boot($, on, w);
+    await threads($, "new haiku Haiku scout -- x");
+    const t = created(w, "Haiku scout");
+    w.fs.set(transcriptPath(APP, t.sessionId), [userRow("x")].join("\n"));
+    w.now = T0 + STUCK_MS + 1000;
+    const list = await threads($, "list");
+    expect(list).toMatch(new RegExp(`${t.id} +◷ stuck`));
+    expect(list).toMatch(/stuck: busy with no new transcript activity for 10 minutes \(a heuristic\)/);
+  });
+
+  test("setup notes the computer-use dependency without failing: missing, old, or ready", async ($, on) => {
+    const w = fresh({ tmuxVersion: "tmux 3.5a" });
+    await boot($, on, w);
+    let out = await threads($, "setup");
+    expect(out).toMatch(/✗ Computer use: dependency note: the codex-computer-use mod is not installed\. Threads work without it/);
+    expect(out).toMatch(/Session threads are ready\./);
+    w.pluginList = JSON.stringify([{ id: "codex-computer-use@two-mods", version: "0.4.2", enabled: true }]);
+    out = await threads($, "setup");
+    expect(out).toMatch(/codex-computer-use 0\.4\.2 is older than 0\.5\.0, which this integration needs; its daemon socket ~\/\.claude\/mcp\/codex-cu\/daemon\.sock is not there/);
+    w.pluginList = JSON.stringify([{ id: "codex-computer-use@two-mods", version: "0.5.0-local.5", enabled: true }]);
+    w.fs.set(`${HOME}/.claude/mcp/codex-cu/daemon.sock`, "");
+    out = await threads($, "setup");
+    expect(out).toMatch(/✓ Computer use: codex-computer-use 0\.5\.0-local\.5 enabled, daemon socket present/);
+    expect(w.runs.some((a) => a.join(" ") === "claude plugin list --json")).toBe(true);
+    expect(versionAtLeast("0.5.0", "0.5.0")).toBe(true);
+    expect(versionAtLeast("0.10.0", "0.5.0")).toBe(true);
+    expect(versionAtLeast("0.4.99", "0.5.0")).toBe(false);
+  });
+
+  test("tool descriptions: no sidebar promise without a link, pin and archive are panel-only, force is the person's", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    const d = (name: string) => String(w.tools![name].description);
+    expect(d("threads_create")).toMatch(/appears in the desktop sidebar only once Remote Control reports a link for it \(bridgeSessionId\); the result says whether a link was seen/);
+    expect(d("threads_create")).not.toMatch(/sends you a short report/);
+    expect(d("threads_pin")).toMatch(/Threads panel only; does not change the app's native sidebar\./);
+    expect(d("threads_archive")).toMatch(/Threads panel only; does not change the app's native sidebar\./);
+    expect(w.tools!.threads_send.inputSchema.properties.force.description).toMatch(/Only when the person asked for it/);
+    // a created thread with a Remote Control link says so
+    w.onSleep = (world) => {
+      for (const [k, v] of world.fs) if (k.startsWith(`${CFG}/sessions/`) && !k.endsWith("4000.json") && !v.includes("bridgeSessionId")) world.fs.set(k, JSON.stringify({ ...JSON.parse(v), bridgeSessionId: "session_abc" }));
+    };
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_create", model: "haiku", title: "Linked", task: "x" } as any);
+    expect(r.result).toMatch(/Remote Control reported a link \(session_abc\), so it shows in the desktop sidebar\./);
+  });
+
+  test("a threads tool that throws answers an error result through its .catch", async ($, on) => {
+    const w = fresh();
+    await boot($, on, w);
+    w.cwdThrows = true;
+    const r: any = await $.tool.call({ tool: "mcp__threads__threads_setup" } as any);
+    expect(r.deny).toMatch(/^threads: threads_setup failed \(.*session\.cwd.*\); nothing more was done\.$/);
   });
 });

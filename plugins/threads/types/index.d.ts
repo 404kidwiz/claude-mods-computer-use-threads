@@ -24,12 +24,14 @@ export type ThreadsRow = {
   socket: string;
   appendedKey?: string;
   costUsd?: number;
+  /** API messages on a model the price table lacks: the cost is a floor when > 0 */
+  costUnpriced?: number;
   pinned?: boolean;
   archived?: boolean;
   forkedFrom?: { sessionId: string; title: string; include: string; file: string };
   handedOff?: boolean;
   seenAt?: number;
-  worktree?: { name: string; repo: string; path: string; branch: string; base: string; launchCwd: string; removed?: boolean; kept?: boolean; commits?: number; dirty?: boolean };
+  worktree?: { name: string; repo: string; path: string; branch: string; base: string; launchCwd: string; removed?: boolean; kept?: boolean; commits?: number; dirty?: boolean; actual?: { branch: string; cwd: string }; mismatch?: string };
   adoptedAt?: number;
   closedBy?: string;
   effort?: string;
@@ -44,9 +46,11 @@ export type ThreadsRow = {
   lastLine: string;
   lastKind: string;
   prompt: string;
+  /** the held message's body, while status is held-message */
+  held?: string;
 };
 export type ThreadsActivity = { kind: string; text: string; at: number };
-export type ThreadsAgentMeta = { costUsd?: number; effort?: string; status?: string; needsYou?: boolean; model?: string; partial?: string; lastAt?: number };
+export type ThreadsAgentMeta = { costUsd?: number; costUnpriced?: number; effort?: string; status?: string; needsYou?: boolean; model?: string; partial?: string; lastAt?: number };
 export type ThreadsPlanPhase = {
   name: string;
   model: string;
@@ -55,6 +59,7 @@ export type ThreadsPlanPhase = {
   acceptance: string;
   permissionMode?: string;
   gate?: string;
+  /** queued, working, awaiting-gate, accepted, revising, blocked, interrupted (its helper ended before handing off), done */
   status: string;
   threadId: string;
   handoffPath: string;
@@ -77,7 +82,52 @@ export type ThreadsPlan = {
   status: string;
   current: number;
   phases: ThreadsPlanPhase[];
-  history?: Array<{ at: number; event: string; phase: number; decision?: string; feedback?: string; thread?: string; hasHandoff?: boolean; then: string[] }>;
+  history?: Array<{ at: number; event: string; phase: number; decision?: string; feedback?: string; thread?: string; hasHandoff?: boolean; reason?: string; then: string[] }>;
+};
+/** <config>/threads/registry.json. A version above 1 was written by a newer mod: read-only here, never rewritten. */
+export type ThreadsRegistry = {
+  version: 1;
+  cap: number;
+  threads: Array<Omit<ThreadsRow, "isMine" | "lastLine" | "lastKind" | "prompt" | "held">>;
+  plans: ThreadsPlan[];
+};
+/** <config>/threads/plans/<id>.json, one per plan, rewritten on every change. */
+export type ThreadsPlanRecord = {
+  version: 1;
+  id: string;
+  title: string;
+  cwd: string;
+  gate: string;
+  backend: string;
+  keepThreads: boolean;
+  lead: { sessionId: string; title: string };
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+  durationMs: number;
+  /** est. API-equivalent; absent when no phase thread has a figure yet */
+  costUsd?: number;
+  costUnpriced: number;
+  phases: Array<{
+    number: number;
+    name: string;
+    model: string;
+    verifiedModel: string;
+    effort: string;
+    permissionMode: string;
+    status: string;
+    thread: { id: string; title: string; sessionId: string; backend: string } | null;
+    handoffPath: string;
+    acceptance: string;
+    revisions: number;
+    startedAt: number;
+    endedAt: number;
+    durationMs: number;
+    costUsd?: number;
+    costUnpriced: number;
+  }>;
+  history: NonNullable<ThreadsPlan["history"]>;
+  backfilled?: boolean;
 };
 export type ThreadsView = { plans?: ThreadsPlan[]; threads: ThreadsRow[]; selfId: string; leadTitle: string; refreshedAt: number; cap: number };
 export type ThreadsUi = { selected: string; mode: "transcript" | "screen"; showOthers: boolean; steering: boolean; notice: string; planView?: boolean; picker?: string; armedClose?: { id: string; at: number } | null; showArchived?: boolean; planIndex?: number; renaming?: boolean };
@@ -98,7 +148,7 @@ declare module "claude-code" {
       wakes: Record<string, { key: string; kind: string; planId?: string; index?: number; threadId?: string; text: string; at: number }>;
       lead: { busy?: boolean };
       setupRan: { at: number; passed: boolean; summary: string };
-      cost: Record<string, { size: number; usd: number }>;
+      cost: Record<string, { size: number; usd: number; unpriced?: number }>;
       surface: string;
     };
   }

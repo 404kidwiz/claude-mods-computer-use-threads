@@ -15,12 +15,14 @@ const CODEX_JS = 'mcp__codex-cu__js'
 const BRIDGE = 'mcp__codex-computer-use__cua'
 const BRIDGE_RESET = 'mcp__codex-computer-use__cua_reset'
 const CODEX_TOOLS = [CODEX_JS, 'mcp__codex-cu__js_reset', BRIDGE, BRIDGE_RESET]
-const OWN_COMPUTER_USE = /^mcp__computer-use__/
+// Claude's own desktop routes: the computer-use MCP tools, and the desktop app's remote computer
+// (request_computer, its enable step, its tools). The browser routes (Claude_Browser, Chrome) stay.
+const OWN_COMPUTER_USE = /^(mcp__computer-use__|mcp__remote-devices__computer($|__)|request_computer$|enable__mcp__remote-devices__computer$)/
 const NODE = '/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node'
 const PANE = 'codex-approval'
 // The daemon this mod speaks to: one cua_repl server per Claude session (and per subagent),
 // so several sessions, such as threads, can drive different apps at the same time.
-const DAEMON_VERSION = 'v2'
+const DAEMON_VERSION = 'v3'
 // The person's standing approvals, shared with the daemon:
 // { "apps": [...always allowed...], "autoApproveAll": true|false }.
 const ALWAYS_FILE = '.claude/mcp/codex-cu/always-allowed.json'
@@ -58,7 +60,13 @@ async function writeAutoApprove($: EngineInterface, home: string, autoApproveAll
 }
 
 const pending = atom({ plugin: 'codex-computer-use', key: 'pending' } as const, null as CodexCuPending)
-const allowed = atom({ plugin: 'codex-computer-use', key: 'allowed' } as const, [] as string[])
+// Apps the person allowed through the pane, per caller in this chat: 'main', or a subagent's id.
+const allowed = atom({ plugin: 'codex-computer-use', key: 'allowed' } as const, {} as Record<string, string[]>)
+// Apps the person denied in this chat. A denial holds for every caller here until they allow it
+// or run /codex-cu forget <app>, so a retry fails at once instead of asking again.
+const denied = atom({ plugin: 'codex-computer-use', key: 'denied' } as const, [] as string[])
+const MAIN = 'main'
+const add = (list: string[] | undefined, app: string) => (list ?? []).includes(app) ? (list ?? []) : [...(list ?? []), app]
 
 const ROUTING = `# Computer use goes through Codex (codex-cu mod is on)
 
@@ -98,14 +106,22 @@ export const typesUnread = (code: unknown) => {
 const TYPES_UNREAD =
   "Refused: this call types or presses keys before reading the app's state. Keystrokes go to whichever window has focus, and a shortcut such as cmd+n can move it. In this same call, read the state (`await app.getAXState({ emit: false, disableDiffing: true })`) before the first keystroke and again after each shortcut, confirm the focused window is the one you mean to type into, then type."
 
+let isOn = true
+let home = ''
+// A reload runs register again without session.start, so every hook settles these first.
+async function ready($: EngineInterface) {
+  if (home !== '') return
+  isOn = (await $.store.get('enabled')) !== false
+  home = (await $.process.run(['printenv', 'HOME'])).stdout.trim()
+}
+
 export const register: Register = on => {
-  let isOn = true
   let isUsedThisTurn = false
-  let home = ''
+  home = ''
 
   on('session.start', async ($, e, next) => {
-    isOn = (await $.store.get('enabled')) !== false
-    home = (await $.process.run(['printenv', 'HOME'])).stdout.trim()
+    home = ''
+    await ready($)
     try {
       await $.command.register({
         name: 'codex-cu',
@@ -113,8 +129,8 @@ export const register: Register = on => {
         argumentHint: '[on|off|status|auto on|auto off|forget <app>]',
         immediate: true,
       })
-    } catch {
-      // The command file still offers it as /codex-computer-use:codex-cu.
+    } catch (error) {
+      $.ui.toast(`codex-cu: /codex-cu not registered (${String(error).slice(0, 120)})`)
     }
     $.ui.status(isOn ? 'Codex CU on' : undefined)
     try {
@@ -148,7 +164,9 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: [BRIDGE, BRIDGE_RESET] }, async ($, e) => {
+    await ready($)
     const { tool, tool_use_id, agentId, ...args } = e as typeof e & { agentId?: string }
+    const caller = agentId ?? MAIN
     // its own Codex session per Claude session, and per subagent inside it
     const session = `${await $.session.id()}${agentId ? `/${agentId}` : ''}`
     const isReset = tool === BRIDGE_RESET
@@ -188,7 +206,7 @@ export const register: Register = on => {
       if (!isUp) return fail(`The Codex computer-use daemon did not start. See ${dir}/daemon.log.`)
     }
 
-    const approve = await read($, allowed)
+    const approve = (await read($, allowed))[caller] ?? []
     const res = await $.http.fetch(`http://codex-cu/${isReset ? 'reset' : 'js'}`, {
       method: 'POST',
       socketPath,
@@ -204,9 +222,12 @@ export const register: Register = on => {
     const declined: string[] = JSON.parse(res.headers['x-codex-declined'] ?? '[]')
     if (declined.length > 0) {
       const app = declined[0]
+      if ((await read($, denied)).includes(app)) {
+        return fail(`The person denied Codex computer use for ${app} in this chat. Do not use ${app}; tell them another way or stop. (They can lift it with /codex-cu forget ${app}.)`)
+      }
       // What the call set out to do, in the model's own words for the person (never its code).
       const title = oneLine((args as { title?: unknown }).title)
-      await update($, pending, () => (title === '' ? { app } : { app, title }))
+      await update($, pending, () => (title === '' ? { app, caller } : { app, caller, title }))
       await $.ui.open({ id: PANE, title: 'Codex computer use', focus: true, closeOnEscape: true, rows: 10 })
       return fail(
         `Codex needs the person's approval to use ${app}. They are being asked in the codex-cu prompt now. Stop and wait: a message will say whether they allowed it, and then you can retry the same call.`,
@@ -214,13 +235,17 @@ export const register: Register = on => {
     }
 
     return res.ok ? { result: res.text, text: res.text } : fail(res.text)
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : { result: 'codex-cu: the bridge failed before reaching Codex. Nothing ran.', text: 'codex-cu: the bridge failed before reaching Codex. Nothing ran.', isError: true as const }))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    await ready($)
     const { Box, Button, Text } = $.ui.resolve(e)
     const ask = await read($, pending)
     if (ask === null) return <Text dimColor>No approval waiting.</Text>
     const app = ask.app
+    const caller = ask.caller ?? MAIN
+    const allow = () => update($, allowed, map => ({ ...map, [caller]: add(map[caller], app) }))
+    const undeny = () => update($, denied, list => list.filter(one => one !== app))
     const wants = ask.title === undefined ? '' : `Wants to: ${ask.title}`
     const columns = e.props.bodyColumns
     // The terminal draws a Button as `[ label ]` and never shows its hotkey; `plain` is the
@@ -243,7 +268,8 @@ export const register: Register = on => {
             autoFocus
             {...keyed}
             onPress={async () => {
-              await update($, allowed, list => (list.includes(app) ? list : [...list, app]))
+              await allow()
+              await undeny()
               await update($, pending, () => null)
               await $.ui.close({ id: PANE })
               await $.prompt.submit({ text: `I allowed Codex computer use to use ${app} for this chat. Retry the last call and continue the task.`, asUser: true })
@@ -257,7 +283,8 @@ export const register: Register = on => {
             onPress={async () => {
               const always = await readAlways($, home)
               if (!always.includes(app)) await writeAlways($, home, [...always, app])
-              await update($, allowed, list => (list.includes(app) ? list : [...list, app]))
+              await allow()
+              await undeny()
               await update($, pending, () => null)
               await $.ui.close({ id: PANE })
               await $.prompt.submit({ text: `I always allowed Codex computer use to use ${app}. Retry the last call and continue the task.`, asUser: true })
@@ -270,6 +297,7 @@ export const register: Register = on => {
             role="dismiss"
             {...keyed}
             onPress={async () => {
+              await update($, denied, list => add(list, app))
               await update($, pending, () => null)
               await $.ui.close({ id: PANE })
               await $.prompt.submit({ text: `I denied Codex computer use for ${app}. Do not use ${app}; tell me another way or stop.`, asUser: true })
@@ -280,9 +308,9 @@ export const register: Register = on => {
     )
   })
 
-  // `/codex-cu` is registered at session start; the plugin's commands/codex-cu.md lists it in
-  // every menu as `/codex-computer-use:codex-cu`. Both land here.
+  // `/codex-cu` is registered at session start.
   on('command.run', { command: ['codex-cu', 'codex-computer-use:codex-cu'] }, async ($, e) => {
+    await ready($)
     const arg = e.args.trim().toLowerCase()
     if (arg === 'auto on' || arg === 'auto off') {
       const isAuto = arg === 'auto on'
@@ -299,7 +327,9 @@ export const register: Register = on => {
       const always = await readAlways($, home)
       const kept = target.toLowerCase() === 'all' ? [] : always.filter(one => one.toLowerCase() !== target.toLowerCase())
       await writeAlways($, home, kept)
-      await update($, allowed, list => (target.toLowerCase() === 'all' ? [] : list.filter(one => one.toLowerCase() !== target.toLowerCase())))
+      const keep = (one: string) => target.toLowerCase() !== 'all' && one.toLowerCase() !== target.toLowerCase()
+      await update($, allowed, map => Object.fromEntries(Object.entries(map).map(([who, list]) => [who, list.filter(keep)])))
+      await update($, denied, list => list.filter(keep))
       return { text: kept.length === always.length ? `${target} was not on the always-allowed list.` : `Removed. Always allowed now: ${kept.length > 0 ? kept.join(', ') : 'none'}.` }
     }
     if (arg === 'on' || arg === 'off') {
@@ -312,7 +342,10 @@ export const register: Register = on => {
 
     const tools = await $.tool.list()
     const isConnected = tools.some(tool => tool.name === CODEX_JS)
-    const apps = await read($, allowed)
+    const byCaller = await read($, allowed)
+    const apps = byCaller[MAIN] ?? []
+    const subagents = Object.entries(byCaller).filter(([who, list]) => who !== MAIN && list.length > 0)
+    const deniedApps = await read($, denied)
     const mode = isOn
       ? 'On. Desktop computer use goes through Codex; my own computer-use tools are blocked.'
       : 'Off. I use my own computer-use tools.'
@@ -322,7 +355,7 @@ export const register: Register = on => {
     const autoLine = standing.autoApproveAll
       ? 'Auto-approve: ON, every app is allowed without asking (/codex-cu auto off to ask again).'
       : 'Auto-approve: off (/codex-cu auto on to allow every app without asking).'
-    const allowedLine = apps.length > 0 ? `This chat: ${apps.join(', ')} allowed through the pane.` : 'No apps allowed through the pane in this chat yet.'
+    const allowedLine = `${apps.length > 0 ? `This chat: ${apps.join(', ')} allowed through the pane.` : 'No apps allowed through the pane in this chat yet.'}${subagents.length > 0 ? ` Subagents: ${subagents.map(([who, list]) => `${who.slice(0, 8)} ${list.join(', ')}`).join('; ')}.` : ''}${deniedApps.length > 0 ? ` Denied here: ${deniedApps.join(', ')}.` : ''}`
     const alwaysLine = `Always allowed: ${always.length > 0 ? always.join(', ') : 'none'} (revoke with /codex-cu forget <app>). Apps set to "Always" inside Codex are allowed too.`
 
     let usersLine = 'In use: none (the daemon is not running).'
@@ -345,6 +378,7 @@ export const register: Register = on => {
   // a session that ends frees its Codex sessions and app leases at once
   on('session.end', async ($, e, next) => {
     const done = await next(e)
+    await ready($)
     try {
       await $.http.fetch('http://codex-cu/end', {
         method: 'POST',
@@ -360,6 +394,7 @@ export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
+    await ready($)
     if (!isOn) return composed
 
     return {
@@ -368,15 +403,18 @@ export const register: Register = on => {
     }
   })
 
-  on('tool.call', { tool: OWN_COMPUTER_USE }, ($, e, next) =>
-    isOn
-      ? {
-          deny: `codex-cu mode is on, so desktop computer use goes through Codex. Use ${BRIDGE} instead (load it with ToolSearch if needed). The person can switch back with /codex-cu off.`,
-        }
-      : next(e),
-  )
+  const OWN_DENIED = `codex-cu mode is on, so desktop computer use goes through Codex. Use ${BRIDGE} instead (load it with ToolSearch if needed). The person can switch back with /codex-cu off.`
+  on('tool.call', { tool: OWN_COMPUTER_USE }, async ($, e, next) => {
+    await ready($)
+    return isOn ? { deny: OWN_DENIED } : next(e)
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: OWN_DENIED }))
 
+  // While on, the codex-cu server's own tools are a second Codex session outside the daemon: no
+  // app leases and no approval pane. Route them to the bridge.
+  const DIRECT_DENIED = `codex-cu mode is on: use ${BRIDGE} (and ${BRIDGE_RESET}) instead, which asks the person for approval in its own pane and keeps apps leased to one session.`
   on('tool.call', { tool: CODEX_TOOLS }, async ($, e, next) => {
+    await ready($)
+    if (isOn && (e.tool === CODEX_JS || e.tool === 'mcp__codex-cu__js_reset')) return { deny: DIRECT_DENIED }
     isUsedThisTurn = true
     if (e.tool === CODEX_JS && typesUnread((e as { code?: unknown }).code)) return { deny: TYPES_UNREAD }
     const ran = await next(e)
@@ -387,7 +425,7 @@ export const register: Register = on => {
     }
 
     return ran
-  })
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: DIRECT_DENIED }))
 
   // Codex tells its computer-use runtime when a turn ends so it can release the
   // session; do the same on the direct connection.

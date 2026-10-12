@@ -4,7 +4,7 @@
 //
 // POST /js    {code, timeout_ms, title, session?, approve?}
 // POST /reset {session?}
-// GET  /health    -> "ok v2"
+// GET  /health    -> "ok v3"
 // GET  /sessions  -> JSON: callers, their apps, leases, last use
 // POST /end   {session}  -> stops that caller's server (and its subagents': session/<agent>), freeing its leases
 // POST /quit      -> shuts down
@@ -20,9 +20,13 @@
 // reported in the x-codex-declined header.
 //
 // App leases: two callers clicking in the same app at once would fight. The first caller to
-// use an app leases it; another caller asking for the same app while the lease is fresh is
-// declined and told in the x-codex-busy header ([{ app, holder, idleSeconds }]). A lease
-// lapses after LEASE_MS without a call from its holder, or when the holder resets or ends.
+// use an app leases it, whether Codex asks to approve it or not (apps set to "Always" inside
+// Codex never ask): the lease is taken from the code's cua.getApp("…") calls before the call
+// runs, and from Codex's approval request. Another caller asking for the same app while the
+// lease is fresh is declined and told in the x-codex-busy header ([{ app, holder, idleSeconds }]).
+// A lease lapses after LEASE_MS without a call from its holder, or when the holder resets or
+// ends. A holder whose lapsed lease another caller took is refused once on its next call, so it
+// cannot keep clicking through an old app handle; it must get the app again.
 //
 // Idle callers' servers stop after SERVER_IDLE_MS; the daemon exits after IDLE_MS with no calls.
 import { spawn } from 'node:child_process';
@@ -32,7 +36,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 
-const VERSION = 'v2';
+const VERSION = 'v3';
 const here = dirname(fileURLToPath(import.meta.url));
 const SOCK = join(here, 'daemon.sock');
 // The person's standing approvals from the mod: { "apps": ["Calculator"], "autoApproveAll": false }.
@@ -41,6 +45,8 @@ const IDLE_MS = 30 * 60 * 1000;
 const SERVER_IDLE_MS = 15 * 60 * 1000;
 const LEASE_MS = 2 * 60 * 1000;
 const MAX_SERVERS = 8;
+// A call longer than its own timeout plus this is treated as hung: that caller's server is stopped.
+const HANG_MS = 30 * 1000;
 
 const readAlways = () => {
   try {
@@ -64,6 +70,8 @@ const touch = () => { clearTimeout(idle); idle = setTimeout(shutdown, IDLE_MS); 
 
 const keyOf = raw => String(raw ?? '').trim().slice(0, 200) || 'default';
 const appOf = message => /use "([^"]+)"/.exec(message)?.[1] ?? message;
+// ponytail: literal names only; an app name held in a variable is leased when Codex asks to approve it.
+const appsIn = code => [...String(code ?? '').matchAll(/cua\.getApp\(\s*(['"`])([^'"`]+)\1/g)].map(m => m[2]);
 
 function leaseHolder(app, key) {
   const holder = leases.get(app);
@@ -72,6 +80,10 @@ function leaseHolder(app, key) {
   // a lease lapses when its holder is gone or quiet
   if (!s || (!s.call && Date.now() - s.lastUsed > LEASE_MS)) {
     leases.delete(app);
+    if (s) {
+      s.apps.delete(app);
+      s.lost.add(app);
+    }
     return null;
   }
   return { app, holder, idleSeconds: s.call ? 0 : Math.round((Date.now() - s.lastUsed) / 1000) };
@@ -85,11 +97,15 @@ function startServer(key) {
   const child = spawn(process.execPath, [join(here, 'launch.mjs')], { stdio: ['pipe', 'pipe', 'inherit'] });
   let nextId = 1;
   const pending = new Map();
-  const s = { child, rpc: null, ready: null, queue: Promise.resolve(), lastUsed: Date.now(), apps: new Set(), call: null };
+  const s = { child, rpc: null, ready: null, queue: Promise.resolve(), lastUsed: Date.now(), apps: new Set(), lost: new Set(), call: null };
   const send = m => child.stdin.write(JSON.stringify(m) + '\n');
-  s.rpc = (method, params) => new Promise((resolve, reject) => {
+  s.rpc = (method, params, timeoutMs) => new Promise((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, { resolve, reject });
+    const timer = timeoutMs && setTimeout(() => {
+      reject(new Error(`Codex computer use did not answer within ${Math.round(timeoutMs / 1000)}s; its session was stopped (REPL variables are lost). Start again with an entry call.`));
+      stopServer(key, 'hung call');
+    }, timeoutMs);
+    pending.set(id, { resolve: m => { clearTimeout(timer); resolve(m); }, reject: e => { clearTimeout(timer); reject(e); } });
     send({ jsonrpc: '2.0', id, method, params });
   });
   createInterface({ input: child.stdout }).on('line', line => {
@@ -110,7 +126,7 @@ function startServer(key) {
           call.declined.push(app);
           send({ jsonrpc: '2.0', id: m.id, result: { action: 'decline' } });
         }
-      } else send({ jsonrpc: '2.0', id: m.id, result: {} });
+      } else send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: `codex-cu daemon does not handle ${m.method}` } });
     } else if (m.id !== undefined && pending.has(m.id)) {
       pending.get(m.id).resolve(m);
       pending.delete(m.id);
@@ -166,13 +182,36 @@ async function call(key, name, args, approve = []) {
   // one call at a time per caller, so its REPL state stays coherent
   const run = s.queue.then(async () => {
     await s.ready;
+    // an app another caller took over while this one was quiet: refuse once, so it gets the app again
+    if (s.lost.size > 0) {
+      const busy = [...s.lost].map(app => ({ app, holder: leases.get(app) ?? 'another session', idleSeconds: 0, lost: true }));
+      s.lost.clear();
+      return { text: 'An app this session was using is now leased to another session.', isError: true, declined: [], busy };
+    }
+    const named = appsIn(args.code);
+    const busy = named.map(app => leaseHolder(app, key)).filter(Boolean);
+    if (busy.length > 0) return { text: `${busy[0].app} is leased to another session.`, isError: true, declined: [], busy };
+    const claimed = named.filter(app => leases.get(app) !== key);
+    for (const app of named) {
+      leases.set(app, key);
+      s.apps.add(app);
+    }
     s.lastUsed = Date.now();
     s.call = { approve, declined: [], busy: [] };
     try {
-      const m = await s.rpc('tools/call', { name, arguments: args });
+      const m = await s.rpc('tools/call', { name, arguments: args }, name === 'js' ? (Number(args.timeout_ms) || 30000) + HANG_MS : undefined);
       const r = m.result ?? { content: [{ type: 'text', text: JSON.stringify(m.error) }], isError: true };
       const text = r.content.map(b => (b.type === 'text' ? b.text : `[${b.type} omitted]`)).join('\n');
+      // a lease taken for this call on an app Codex then declined is given back
+      for (const app of s.call.declined) {
+        if (claimed.includes(app) && leases.get(app) === key) {
+          leases.delete(app);
+          s.apps.delete(app);
+        }
+      }
       return { text, isError: Boolean(r.isError), declined: [...s.call.declined], busy: [...s.call.busy] };
+    } catch (error) {
+      return { text: String(error.message ?? error), isError: true, declined: [], busy: [] };
     } finally {
       s.call = null;
       s.lastUsed = Date.now();

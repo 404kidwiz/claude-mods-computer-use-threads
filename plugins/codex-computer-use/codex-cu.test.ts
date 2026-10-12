@@ -30,8 +30,16 @@ test('on by default: blocks Claude computer use, passes Codex and other tools', 
   const own = await $.tool.call({ tool: 'mcp__computer-use__screenshot', tool_use_id: 'a' })
   expect(String(own.deny)).toContain('mcp__codex-computer-use__cua')
 
+  // the desktop app's remote computer is Claude's own route too
+  for (const tool of ['request_computer', 'enable__mcp__remote-devices__computer', 'mcp__remote-devices__computer']) {
+    expect(String((await $.tool.call({ tool, tool_use_id: tool } as any)).deny)).toContain('mcp__codex-computer-use__cua')
+  }
+  // the codex-cu server's own tool skips leases and the pane, so it goes through the bridge too
   const codex = await $.tool.call({ tool: 'mcp__codex-cu__js', tool_use_id: 'b', code: 'await cua.getState();' })
-  expect(codex.text).toBe('ran mcp__codex-cu__js')
+  expect(String(codex.deny)).toContain('use mcp__codex-computer-use__cua')
+
+  const browser = await $.tool.call({ tool: 'mcp__Claude_Browser__navigate', tool_use_id: 'e', url: 'https://example.com' } as any)
+  expect(browser.text).toBe('ran mcp__Claude_Browser__navigate')
 
   const other = await $.tool.call({ tool: 'mcp__claude-in-chrome__navigate', tool_use_id: 'c', url: 'https://example.com' })
   expect(other.text).toBe('ran mcp__claude-in-chrome__navigate')
@@ -43,6 +51,52 @@ test('off when the person turned it off: Claude computer use runs', async ($, on
 
   const own = await $.tool.call({ tool: 'mcp__computer-use__screenshot', tool_use_id: 'a' })
   expect(own.text).toBe('ran mcp__computer-use__screenshot')
+  const codex = await $.tool.call({ tool: 'mcp__codex-cu__js', tool_use_id: 'b', code: 'await cua.getState();' })
+  expect(codex.text).toBe('ran mcp__codex-cu__js')
+})
+
+test('a reload without session.start still knows the home folder and the saved switch', async ($, on) => {
+  engine(on, false)
+  const own = await $.tool.call({ tool: 'mcp__computer-use__screenshot', tool_use_id: 'a' })
+  expect(own.text).toBe('ran mcp__computer-use__screenshot')
+})
+
+test('a denied app fails at once on retry, and subagents keep their own approvals', async ($, on) => {
+  engine(on)
+  const bodies: any[] = []
+  on('mcp.call', () => ({ deny: 'not connected in this session' }))
+  on('http.fetch', ($, e) => {
+    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v3' } }
+    const body = JSON.parse(String(e.init?.body))
+    bodies.push(body)
+    const ok = body.approve.includes('Calculator')
+    return { value: { status: ok ? 200 : 422, ok, headers: ok ? {} : { 'x-codex-declined': '["Calculator"]' }, text: ok ? 'done' : 'not approved' } }
+  })
+  const opened: string[] = []
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => ({ value: undefined }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  await $.session.start(start)
+  const call = { tool: 'mcp__codex-computer-use__cua', tool_use_id: 'a', code: 'let app = await cua.getApp("Calculator");' }
+
+  // a subagent asks; the person allows it for that subagent only
+  await $.tool.call({ ...call, agentId: 'agent-7' } as any)
+  const ui = await $.ui.mount({ plugin: 'codex-computer-use', surface: 'desktop', component: 'Pane', requestId: 'codex-approval', props: paneProps() })
+  await ui.press({ key: 'allow' })
+  expect((await $.tool.call({ ...call, agentId: 'agent-7' } as any)).text).toBe('done')
+  expect(bodies.at(-1).approve).toEqual(['Calculator'])
+  await $.tool.call(call as any)
+  expect(bodies.at(-1).approve).toEqual([])
+
+  // the main chat is asked, the person denies; the retry fails without asking again
+  await ui.press({ key: 'deny' })
+  const asked = opened.length
+  const retry = await $.tool.call(call as any)
+  expect(String(retry.text)).toContain('denied Codex computer use for Calculator')
+  expect(opened.length).toBe(asked)
 })
 
 test('daemon route: an unapproved app opens the approval pane; allowed apps are passed on', async ($, on) => {
@@ -53,7 +107,7 @@ test('daemon route: an unapproved app opens the approval pane; allowed apps are 
   let declined = '["Calculator"]'
   on('mcp.call', () => ({ deny: 'not connected in this session' }))
   on('http.fetch', ($, e) => {
-    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v2' } }
+    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v3' } }
     bodies.push(String(e.init?.body))
     return { value: { status: 422, ok: false, headers: { 'x-codex-declined': declined }, text: 'not approved' } }
   })
@@ -79,16 +133,16 @@ test('daemon route: an unapproved app opens the approval pane; allowed apps are 
   expect(second.text).toBe('not approved')
 })
 
-// The v2 daemon: one Codex session per Claude session and per subagent, apps leased to one session.
+// The v3 daemon: one Codex session per Claude session and per subagent, apps leased to one session.
 const daemon = (on: On, opts: { health?: string; busy?: string } = {}) => {
   const calls: { url: string; body: any }[] = []
   const runs: string[][] = []
-  let health = opts.health ?? 'ok v2'
+  let health = opts.health ?? 'ok v3'
   on('mcp.call', () => ({ deny: 'not connected in this session' }))
   on('process.run', ($, e) => {
     runs.push([...e.argv])
     // starting the daemon brings up the current version
-    if (String(e.argv[2] ?? '').includes('daemon.mjs')) health = 'ok v2'
+    if (String(e.argv[2] ?? '').includes('daemon.mjs')) health = 'ok v3'
     return { value: { exitCode: 0, stdout: '/tmp\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('clock.sleep', () => ({ value: undefined }))
@@ -172,8 +226,8 @@ test('a shortcut can move focus, so typing after it needs a fresh read', () => {
   expect(typesUnread('await tab.getAXState(); await tab.pressKey(4, "ctrl+a"); await tab.typeText(4, "x")')).toBe(true)
 })
 
-test('the raw Codex tool is denied when it types unread', async ($, on) => {
-  engine(on)
+test('the raw Codex tool (mod off) is denied when it types unread', async ($, on) => {
+  engine(on, false)
   await $.session.start(start)
   const blind = await $.tool.call({ tool: 'mcp__codex-cu__js', tool_use_id: 'd', code: 'await app.typeText("x")' })
   expect(String(blind.deny)).toContain('types or presses keys before reading')
@@ -201,7 +255,7 @@ const awaiting = async ($: Engine, on: On, title?: string) => {
   const prompts: { text: string; asUser: boolean }[] = []
   on('mcp.call', () => ({ deny: 'not connected in this session' }))
   on('http.fetch', ($, e) => {
-    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v2' } }
+    if (e.url.endsWith('/health')) return { value: { status: 200, ok: true, headers: {}, text: 'ok v3' } }
     const body = JSON.parse(String(e.init?.body))
     bodies.push(body)
     // like the daemon: Calculator is declined until it is among the apps the mod approves

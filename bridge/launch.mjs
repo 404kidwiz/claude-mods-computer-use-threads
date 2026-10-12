@@ -23,7 +23,9 @@ if (!versions.length) {
 const cfg = JSON.parse(readFileSync(join(root, versions.at(-1), '.mcp.json'), 'utf8')).mcpServers.cua_repl;
 // Pass only what a macOS process needs, not this session's whole environment (API keys, tokens).
 const KEEP = /^(HOME|PATH|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_\w+|__CF_USER_TEXT_ENCODING|CODEX_HOME)$/;
-const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => KEEP.test(k)));
+// The config may name further variables to pass through (env_vars); those pass too, nothing else.
+const named = new Set(Array.isArray(cfg.env_vars) ? cfg.env_vars : []);
+const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => KEEP.test(k) || named.has(k)));
 const child = spawn(cfg.command, cfg.args || [], {
   stdio: 'inherit',
   env: { ...env, ...(cfg.env || {}) },

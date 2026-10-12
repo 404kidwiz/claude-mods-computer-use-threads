@@ -114,7 +114,7 @@ The mod does not replace Claude’s reasoning with another model. The computer c
 
 ## What was checked
 
-The exported mods passed **102 Threads tests and 7 Computer Use tests** in the installed mod test runner. These use simulated engine behavior; they are not proof of a fresh end-to-end desktop installation. The setup helper has separate tests for empty approvals, preservation of existing files, paths with spaces and component selection.
+The exported mods passed **167 Threads tests and 26 Computer Use tests (plus 5 bridge tests)** in the installed mod test runner. These use simulated engine behavior; they are not proof of a fresh end-to-end desktop installation. The setup helper has separate tests for empty approvals, preservation of existing files, paths with spaces and component selection.
 
 The final video transcript records a working Calculator/TextEdit demo and Threads sessions appearing in the panel. A new viewer’s installation still needs the [live acceptance checks](docs/DEMO.md). Exact verification scope and packaging changes are recorded in [Verification](docs/VERIFICATION.md).
 

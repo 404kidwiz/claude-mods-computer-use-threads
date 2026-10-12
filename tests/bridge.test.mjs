@@ -66,3 +66,13 @@ test('launch passes only a minimal environment to the Codex server', async (t) =
  assert.equal(env.HOME,home);assert.equal(env.LC_ALL,'C');assert.equal(env.CUA_FLAG,'1');
  assert.equal(env.OPENAI_API_KEY,undefined);assert.equal(env.GH_TOKEN,undefined);
 });
+
+test('an app Codex never asks about is still leased from the code, and a lapsed holder is told once',async t=>{
+ const {call}=await fixture(t);
+ const get='let app = await cua.getApp("Calculator");';
+ assert.equal((await call('/js',{session:'a',code:get})).status,200);
+ const r=await call('/js',{session:'b',code:get});
+ assert.equal(r.status,422);assert.equal(JSON.parse(r.headers['x-codex-busy'])[0].holder,'a');
+ await call('/reset',{session:'a'});
+ assert.equal((await call('/js',{session:'b',code:get})).status,200);
+});

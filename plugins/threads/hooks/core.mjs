@@ -5,9 +5,11 @@ export const TMUX_SOCKET = "cc-threads";
 export const TITLE_PREFIX = "Thread | ";
 export const DEFAULT_CAP = 4;
 export const MAX_CAP = 12;
-export const STATUSES = ["starting", "working", "idle", "needs-you", "held-message", "needs-login", "needs-trust", "exited", "closed"];
-export const LIVE = new Set(["starting", "working", "idle", "needs-you", "held-message", "needs-login", "needs-trust"]);
-export const ATTENTION = new Set(["needs-you", "held-message", "needs-login", "needs-trust"]);
+export const STATUSES = ["starting", "working", "stuck", "idle", "needs-you", "held-message", "needs-login", "needs-trust", "exited", "closed"];
+export const LIVE = new Set(["starting", "working", "stuck", "idle", "needs-you", "held-message", "needs-login", "needs-trust"]);
+export const ATTENTION = new Set(["needs-you", "held-message", "needs-login", "needs-trust", "stuck"]);
+// ponytail: a heuristic. Busy with no new transcript row this long reads as stuck; a long silent build looks the same.
+export const STUCK_MS = 10 * 60 * 1000;
 // Per-thread --settings. crossSessionInbound accept: Claude Code would otherwise hold messages
 // between sessions of different permission classes. skipDangerousModePermissionPrompt (read from
 // flag settings too): without it a bypass thread sits on the one-time bypass warning dialog.
@@ -50,6 +52,8 @@ export const SCRUB_ENV = [
 ];
 
 export const LOGIN_HINT = "Threads need the terminal Claude Code login. Run `claude auth login` in Terminal once.";
+// never a silent switch: an inline thread is a subagent of the lead chat, not an independent session
+export const INLINE_OFFER = 'Nothing was started: Threads never switch to an inline thread on their own. If the person asks for one, backend: "inline" (/threads new ... --inline) runs it as a background agent inside this chat instead.';
 
 // ---- models -------------------------------------------------------------------
 
@@ -66,6 +70,33 @@ export function modelChip(model) {
   const m = String(model ?? "").toLowerCase();
   for (const f of ["haiku", "sonnet", "opus", "fable", "mythos"]) if (m.includes(f)) return f;
   return m ? m.slice(0, 8) : "?";
+}
+
+// ---- dependencies ----------------------------------------------------------------
+
+// The codex-computer-use version this integration needs (per-caller identity and app leases).
+export const CU_MIN_VERSION = "0.5.0";
+
+// "0.5.0-local.5" >= "0.5.0": numeric major.minor.patch only; a suffix (a local build) counts as that release.
+export function versionAtLeast(version, min) {
+  const nums = (v) => String(v ?? "").split(/[-+]/)[0].split(".").map((x) => Number(x) || 0);
+  const a = nums(version);
+  const b = nums(min);
+  if (!/^\d/.test(String(version ?? ""))) return false;
+  for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  return true;
+}
+
+// The codex-computer-use entry of `claude plugin list --json` (or its text form), or null when it is not installed.
+export function computerUsePlugin(stdout) {
+  try {
+    const list = JSON.parse(stdout);
+    const hit = Array.isArray(list) ? list.find((x) => /^codex-computer-use@/.test(String(x?.id ?? ""))) : null;
+    return hit ? { version: String(hit.version ?? ""), enabled: hit.enabled !== false } : null;
+  } catch {
+    const m = /codex-computer-use@\S+[\s\S]*?Version:\s*(\S+)[\s\S]*?Status:\s*(\S+)/.exec(String(stdout ?? ""));
+    return m ? { version: m[1], enabled: !/disabled/i.test(m[2]) } : null;
+  }
 }
 
 // ---- titles, ids, refs ----------------------------------------------------------
@@ -376,7 +407,8 @@ export function screenLines(text, n) {
 // ---- status ----------------------------------------------------------------------------
 
 // tmux: { isLive, isDead }, session: the ~/.claude/sessions json or null, pidAlive, screen: readScreen()
-export function statusOf({ previous, tmux, session, pidAlive, screen, now, createdAt }) {
+// lastAt: the newest transcript row's time (0 when unknown); busy with nothing new for STUCK_MS is stuck
+export function statusOf({ previous, tmux, session, pidAlive, screen, now, createdAt, lastAt = 0 }) {
   if (previous === "closed") return "closed";
   if (!tmux?.isLive || tmux.isDead) return "exited";
   if (screen?.needsLogin) return "needs-login";
@@ -384,7 +416,7 @@ export function statusOf({ previous, tmux, session, pidAlive, screen, now, creat
   if (screen?.heldMessage) return "held-message";
   if (screen?.needsYou) return "needs-you";
   if (session && pidAlive !== false) {
-    if (session.status === "busy") return "working";
+    if (session.status === "busy") return lastAt && now - lastAt >= STUCK_MS ? "stuck" : "working";
     if (session.status === "waiting") return "needs-you";
     if (session.status === "idle") return "idle";
   }
@@ -397,6 +429,7 @@ export function dotOf(status) {
     {
       starting: "◌",
       working: "●",
+      stuck: "◷",
       idle: "○",
       "needs-you": "◆",
       "held-message": "✉",
@@ -413,6 +446,7 @@ export function colorOf(status) {
     {
       starting: "cyan",
       working: "yellow",
+      stuck: "red",
       idle: "green",
       "needs-you": "magenta",
       "held-message": "magenta",
@@ -601,18 +635,20 @@ export function emptyRegistry() {
 
 // Parses the registry file; a file that does not parse is reported, never thrown.
 export function parseRegistry(text) {
-  if (text === null || text === undefined || String(text).trim() === "") return { registry: emptyRegistry(), isCorrupt: false };
+  if (text === null || text === undefined || String(text).trim() === "") return { registry: emptyRegistry(), isCorrupt: false, isReadOnly: false };
   try {
     const data = JSON.parse(text);
-    if (!data || typeof data !== "object" || !Array.isArray(data.threads)) return { registry: emptyRegistry(), isCorrupt: true };
+    if (!data || typeof data !== "object" || !Array.isArray(data.threads)) return { registry: emptyRegistry(), isCorrupt: true, isReadOnly: false };
     const cap = Number.isInteger(data.cap) && data.cap >= 1 && data.cap <= MAX_CAP ? data.cap : DEFAULT_CAP;
     const threads = data.threads.filter((t) => t && typeof t.id === "string" && typeof t.sessionId === "string");
     const plans = Array.isArray(data.plans) ? data.plans.filter((x) => x && typeof x.id === "string" && Array.isArray(x.phases)) : [];
+    // a newer mod's format: read what this one understands, and never write it back (isReadOnly)
+    if (Number(data.version) > 1) return { registry: { ...data, cap, threads, plans }, isCorrupt: false, isReadOnly: true };
     // keys a newer version wrote are kept as they are, so an older copy of the mod never drops them
     const { version: _v, cap: _c, threads: _t, plans: _p, ...rest } = data;
-    return { registry: { ...rest, version: 1, cap, threads, plans }, isCorrupt: false };
+    return { registry: { ...rest, version: 1, cap, threads, plans }, isCorrupt: false, isReadOnly: false };
   } catch {
-    return { registry: emptyRegistry(), isCorrupt: true };
+    return { registry: emptyRegistry(), isCorrupt: true, isReadOnly: false };
   }
 }
 
@@ -674,9 +710,11 @@ export function bandText(threads) {
   const live = threads.filter((t) => LIVE.has(t.status));
   if (live.length === 0) return "";
   const working = live.filter((t) => t.status === "working" || t.status === "starting").length;
-  const needs = live.filter((t) => ATTENTION.has(t.status)).length;
+  const stuck = live.filter((t) => t.status === "stuck").length;
+  const needs = live.filter((t) => ATTENTION.has(t.status)).length - stuck;
   const parts = [`⇶ ${live.length} thread${live.length === 1 ? "" : "s"}`];
   if (working) parts.push(`${working} working`);
+  if (stuck) parts.push(`${stuck} stuck`);
   if (needs) parts.push(`${needs} need${needs === 1 ? "s" : ""} you`);
   const fresh = threads.filter(isUnread).length;
   if (fresh) parts.push(`${fresh} new`);
@@ -689,11 +727,11 @@ export function bandText(threads) {
 export const BACKENDS = ["auto", "session", "inline"];
 export const ACTIVITY_MAX = 60;
 
-// auto: a real session when the terminal login works, otherwise a subagent of this chat.
-export function chooseBackend(requested, isLoggedIn) {
+// auto is always a real session: without the terminal login the caller refuses with the fix (INLINE_OFFER), never switches.
+export function chooseBackend(requested) {
   const want = String(requested ?? "auto").toLowerCase();
   if (!BACKENDS.includes(want)) return { error: `Unknown backend "${requested}". Use auto, session or inline.` };
-  if (want === "auto") return { backend: isLoggedIn ? "session" : "inline", isAuto: true };
+  if (want === "auto") return { backend: "session", isAuto: true };
   return { backend: want, isAuto: false };
 }
 
@@ -728,7 +766,7 @@ export function statusOfInline({ previous, isMine, agent, meta, leadAlive, now, 
     return now - (createdAt ?? now) < 15000 && LIVE.has(previous) ? previous : "exited";
   }
   const st = String(agent.status ?? "").toLowerCase();
-  if (st === "running" || st === "pending") return meta?.status === "idle" ? "idle" : "working";
+  if (st === "running" || st === "pending") return meta?.status === "idle" ? "idle" : meta?.lastAt && now - meta.lastAt >= STUCK_MS ? "stuck" : "working";
   if (st === "completed") return "idle";
   if (st === "failed" || st === "killed" || st === "stopped" || st === "cancelled") return "exited";
   return meta?.status ?? "working";
@@ -787,10 +825,17 @@ export function reportRow({ title, id, model, answer }) {
   };
 }
 
-// Should a finished answer be recorded and appended? Not twice, and not right after the thread messaged the lead itself.
-export function shouldReport({ lastReport, appendedKey, key, now }) {
+// Should a finished answer be recorded and appended? Not twice, and not when the thread's own note to the lead
+// already carried it: the note says the same thing, or came after the answer. A mid-task note never swallows the
+// answer. Without the answer's time (an untimed row), the old one-minute window decides.
+export function shouldReport({ lastReport, appendedKey, key, now, answer, answerAt }) {
   if (!key || key === appendedKey) return { report: false, reason: "already reported" };
-  if (lastReport?.source === "peer" && now - (lastReport.at ?? 0) < PEER_DEDUPE_MS) return { report: false, reason: "the thread reported itself" };
+  if (lastReport?.source === "peer") {
+    const norm = (s) => oneLine(stripTags(s)).toLowerCase().slice(0, ANSWER_MAX - 1);
+    const same = Boolean(answer) && norm(lastReport.text) === norm(answer);
+    const after = answerAt ? (lastReport.at ?? 0) >= answerAt : now - (lastReport.at ?? 0) < PEER_DEDUPE_MS;
+    if (same || after) return { report: false, reason: "the thread reported itself" };
+  }
   return { report: true };
 }
 
@@ -821,7 +866,8 @@ export function checkEffort(raw) {
 // threads_plan_advance) or user (/threads plan next).
 
 export const GATES = ["auto", "lead", "user"];
-export const PHASE_STATES = ["queued", "working", "awaiting-gate", "accepted", "revising", "blocked", "done"];
+// interrupted: its helper exited, crashed or was closed before it handed off; never counted as done, /threads plan retry restarts it
+export const PHASE_STATES = ["queued", "working", "awaiting-gate", "accepted", "revising", "blocked", "interrupted", "done"];
 export const MAX_PHASES = 8;
 export const MAX_REVISIONS = 2;
 
@@ -954,6 +1000,7 @@ export function handoffNudge(handoffPath, plan) {
 //   { type: "next" }   /threads plan next (the user gate)
 //   { type: "started", index, threadId, handoffPath, at }   a phase thread was created
 //   { type: "retry", index }   start that phase again
+//   { type: "interrupted", index, reason }   the phase thread exited or was closed with no new final answer
 //   { type: "stop" }
 export function stepPlan(plan, event) {
   const p = { ...plan, phases: plan.phases.map((x) => ({ ...x })) };
@@ -1015,6 +1062,18 @@ export function stepPlan(plan, event) {
         ph.note = gate === "lead" ? "waiting for the lead's review" : "waiting for /threads plan next";
         actions.push({ type: gate === "lead" ? "ask-lead" : "ask-user", index: cur });
       }
+      break;
+    }
+    case "interrupted": {
+      if (event.index !== cur || !ph || (ph.status !== "working" && ph.status !== "revising")) {
+        actions.push({ type: "ignored", reason: "not the phase that is running" });
+        break;
+      }
+      ph.status = "interrupted";
+      ph.endedAt = event.at ?? 0;
+      ph.note = `interrupted: ${event.reason || "its thread ended before handing off"}`;
+      p.status = "interrupted";
+      actions.push({ type: "interrupted", index: cur, reason: ph.note });
       break;
     }
     case "decision":
@@ -1080,6 +1139,7 @@ function historyEntry(event, actions, cur) {
   if (event.feedback) e.feedback = oneLine(event.feedback).slice(0, 300);
   if (event.threadId) e.thread = event.threadId;
   if (event.hasHandoff !== undefined) e.hasHandoff = event.hasHandoff;
+  if (event.reason) e.reason = oneLine(event.reason).slice(0, 300);
   e.then = actions.map((a) => a.type);
   return e;
 }
@@ -1114,7 +1174,7 @@ export const PLAN_USAGE =
   "Usage is /threads plan start <title> [--gate auto|lead|user] [--mode acceptEdits|...] [--cwd <path>] -- <model>[/<effort>] <Name>: <task> || <model> <Name>: <task> ...";
 
 export function planStatusText(plan, threadsById = new Map()) {
-  const mark = { queued: "·", working: "●", "awaiting-gate": "◆", accepted: "✓", revising: "↻", blocked: "✕", done: "✓" };
+  const mark = { queued: "·", working: "●", "awaiting-gate": "◆", accepted: "✓", revising: "↻", blocked: "✕", interrupted: "!", done: "✓" };
   const lines = [`Plan ${plan.title} (${plan.id}) · ${plan.status} · gate ${plan.gate} · ${plan.cwd}`];
   plan.phases.forEach((ph, i) => {
     const t = threadsById.get(ph.threadId);
@@ -1133,6 +1193,10 @@ export function planStatusText(plan, threadsById = new Map()) {
 // many tokens went to the 1-hour and 5-minute caches is priced exactly (2x and 1.25x input);
 // otherwise by loop, as task-budget measured: a main loop writes at the 1-hour rate, a subagent
 // at the 5-minute rate.
+
+// The day the table below was last checked. Its source date is not recorded, so this is the day it was written down.
+export const PRICES_AS_OF = "2026-10-12";
+export const COST_LABEL = `est. API-equivalent, list prices as recorded ${PRICES_AS_OF}, not your bill`;
 
 export const PRICES = [
   { match: /opus-5-5/, input: 4, output: 20, cacheRead: 0.2 },
@@ -1193,6 +1257,25 @@ export function costFromTranscript(jsonl) {
   return { usd, unpriced };
 }
 
+// A cost for people: unknown is "cost unavailable", never $0; usage on a model the table lacks makes it a floor.
+export function costText(usd, unpriced = 0) {
+  if (usd === undefined || usd === null) return "cost unavailable";
+  if (unpriced > 0) return usd > 0 ? `≥ ${money(usd)}, some usage unpriced` : "cost unavailable";
+  return money(usd);
+}
+
+// Sums threads' costs; one with no cost yet counts as unpriced, so the total is shown as a floor.
+export function totalCost(list) {
+  let usd;
+  let unpriced = 0;
+  for (const x of list) {
+    if (x.costUsd === undefined || x.costUsd === null) unpriced += 1;
+    else usd = (usd ?? 0) + x.costUsd;
+    unpriced += x.costUnpriced || 0;
+  }
+  return { usd, unpriced };
+}
+
 export function money(usd) {
   const n = Number(usd) || 0;
   if (n === 0) return "$0";
@@ -1221,10 +1304,14 @@ export function planRecord(plan, threadsById, now, opts = {}) {
       startedAt: ph.startedAt || 0,
       endedAt: ph.endedAt || 0,
       durationMs: ph.startedAt && ph.endedAt ? ph.endedAt - ph.startedAt : 0,
-      costUsd: t?.costUsd ?? 0,
+      // a phase that never got a thread cost nothing; one whose thread has no figure is unknown, not $0
+      costUsd: ph.threadId ? t?.costUsd : 0,
+      costUnpriced: t?.costUnpriced ?? 0,
     };
   });
+  const total = totalCost(phases);
   return {
+    version: 1,
     id: plan.id,
     title: plan.title,
     cwd: plan.cwd,
@@ -1236,7 +1323,8 @@ export function planRecord(plan, threadsById, now, opts = {}) {
     createdAt: plan.createdAt,
     updatedAt: now,
     durationMs: now - (plan.createdAt ?? now),
-    costUsd: phases.reduce((a, x) => a + (x.costUsd || 0), 0),
+    costUsd: total.usd,
+    costUnpriced: total.unpriced,
     phases,
     history: plan.history ?? [],
     ...(opts.backfilled ? { backfilled: true } : {}),
@@ -1249,7 +1337,7 @@ export function planRecordMarkdown(r) {
   const lines = [
     `# Plan ${r.title} (${r.id})`,
     "",
-    `Status: ${r.status} · gate ${r.gate} · ${r.backend} threads · started ${when(r.createdAt)} · ${dur(r.durationMs)} · est. API-equivalent ${money(r.costUsd)}`,
+    `Status: ${r.status} · gate ${r.gate} · ${r.backend} threads · started ${when(r.createdAt)} · ${dur(r.durationMs)} · ${costText(r.costUsd, r.costUnpriced)} ${COST_LABEL}`,
     `Project: ${r.cwd}`,
     `Lead: ${r.lead?.title ?? "?"} (${r.lead?.sessionId ?? "?"})`,
     ...(r.backfilled ? ["", "Backfilled from the registry: this plan ran before history was kept, so gate decisions, events and some timings are not known."] : []),
@@ -1258,7 +1346,7 @@ export function planRecordMarkdown(r) {
     "",
     "| # | Phase | Model | Effort | Mode | Status | Thread | Time | Cost |",
     "|---|---|---|---|---|---|---|---|---|",
-    ...r.phases.map((x) => `| ${String(x.number).padStart(2, "0")} | ${x.name} | ${x.verifiedModel || x.model} | ${x.effort || "-"} | ${x.permissionMode || "-"} | ${x.status} | ${x.thread ? `${x.thread.id}` : "-"} | ${dur(x.durationMs)} | ${money(x.costUsd)} |`),
+    ...r.phases.map((x) => `| ${String(x.number).padStart(2, "0")} | ${x.name} | ${x.verifiedModel || x.model} | ${x.effort || "-"} | ${x.permissionMode || "-"} | ${x.status} | ${x.thread ? `${x.thread.id}` : "-"} | ${dur(x.durationMs)} | ${costText(x.costUsd, x.costUnpriced)} |`),
     "",
     "## Handoffs",
     "",
@@ -1266,7 +1354,7 @@ export function planRecordMarkdown(r) {
     "",
     "## Events",
     "",
-    ...r.history.map((h) => `- ${when(h.at)} phase ${String(h.phase).padStart(2, "0")} ${h.event}${h.decision ? ` ${h.decision}` : ""}${h.feedback ? ` ("${h.feedback}")` : ""}${h.hasHandoff === false ? " (no handoff)" : ""} -> ${h.then.join(", ") || "-"}`),
+    ...r.history.map((h) => `- ${when(h.at)} phase ${String(h.phase).padStart(2, "0")} ${h.event}${h.decision ? ` ${h.decision}` : ""}${h.feedback ? ` ("${h.feedback}")` : ""}${h.hasHandoff === false ? " (no handoff)" : ""}${h.reason ? ` (${h.reason})` : ""} -> ${h.then.join(", ") || "-"}`),
     "",
   ];
   return lines.join("\n");

@@ -9,8 +9,9 @@
 //   - watch: tmux capture-pane (the live screen) and the transcript tail,
 //   - steer: $.session.send({ to: { sessionId } }) (a message, works mid-turn),
 //     or tmux send-keys (typing, Escape to interrupt, /model, permission keys),
-//   - hear back: the thread's brief asks it to SendMessage a short report to the
-//     lead's socket; `session.receive` records it and lets it through to the model.
+//   - hear back: the completion watcher reads the thread's transcript and puts its
+//     final answer in front of the lead once; an optional note the thread sends to the
+//     lead's socket is recorded by `session.receive` and let through to the model.
 //
 // Every thread is in <config>/threads/registry.json (shared by every chat on the
 // machine) and every action in <config>/threads/events.jsonl.
@@ -90,7 +91,6 @@ import {
   validatePlan,
   costFromTranscript,
   costOfUsage,
-  money,
   planRecord,
   planRecordMarkdown,
   conversationOutline,
@@ -106,6 +106,13 @@ import {
   tidyFolder,
   tidyPath,
   tidyPaths,
+  CU_MIN_VERSION,
+  computerUsePlugin,
+  versionAtLeast,
+  INLINE_OFFER,
+  COST_LABEL,
+  costText,
+  totalCost as sumCosts,
 } from "./core.mjs";
 
 const PANE = "threads";
@@ -183,6 +190,15 @@ let idleCloseMinutes = 120;
 let lastIdleCheck = 0;
 const MODE_KEY = "defaultMode";
 
+// A threads tool that throws or overruns answers an error result (its .catch) instead of being skipped silently.
+function toolFailure(name, next) {
+  return `threads: ${name} failed (${clip(oneLine(next.error?.message ?? next.error?.kind ?? "error"), 200)}); nothing more was done.`;
+}
+// The observers below only watch; one that fails must never block what it watched.
+function passThrough($, e, next) {
+  return next(e);
+}
+
 export function register(on, options) {
   configuredMode = checkMode(options?.defaultPermissionMode).mode ?? DEFAULT_MODE;
   const idle = Number(options?.idleCloseMinutes);
@@ -245,12 +261,12 @@ export function register(on, options) {
     });
     if (made.error) return { deny: made.error };
     return { result: made.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_create", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_list" }, async ($, e) => {
     await refresh($);
     return { result: await listText($, { forModel: true, includeArchived: e?.include_archived === true, includeClosed: e?.include_closed === true }) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_list", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_read" }, async ($, e) => {
     await refresh($);
@@ -259,7 +275,7 @@ export function register(on, options) {
     const text = await readText($, found.thread, e.view === "screen" ? "screen" : "transcript", e.limit);
     if (isUnread(found.thread)) await markRead($, [found.thread.id]);
     return { result: text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_read", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_send" }, async ($, e) => {
     await refresh($);
@@ -271,12 +287,12 @@ export function register(on, options) {
     if (!message) return { deny: "message is empty." };
     if (mode === "type") return { result: await typeIntoThread($, found.thread, message) };
     if (mode !== "message") return { deny: `Unknown mode "${mode}". Use message, type or interrupt.` };
-    return { result: await sendToThread($, found.thread, message) };
-  });
+    return { result: await sendToThread($, found.thread, message, { force: e.force === true }) };
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_send", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_wait" }, async ($, e, next) => {
     return { result: await waitForThreads($, e, next?.signal) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_wait", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_close" }, async ($, e) => {
     await refresh($);
@@ -291,71 +307,71 @@ export function register(on, options) {
     const found = await findThread($, e.id);
     if (found.error) return { deny: found.error };
     return { result: await closeThread($, found.thread, { confirmed, from: "tool" }) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_close", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_show" }, async ($, e) => {
     startTicker($);
     return { result: await showPane($, { id: e.id, plan: e.plan }) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_show", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_open" }, async ($, e) => {
     await refresh($);
     const found = await findThread($, e.id);
     if (found.error) return { deny: found.error };
     return { result: await openThread($, found.thread) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_open", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_fork" }, async ($, e) => {
     startTicker($);
     const made = await forkThread($, e);
     if (made.error) return { deny: made.error };
     return { result: made.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_fork", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_handoff" }, async ($, e) => {
     startTicker($);
     const made = await handoffThread($, e);
     if (made.error) return { deny: made.error };
     return { result: made.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_handoff", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_rename" }, async ($, e) => {
     await refresh($);
     const found = await findThread($, e.id, { includeArchived: true });
     if (found.error) return { deny: found.error };
     return { result: await renameThread($, found.thread, e.title) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_rename", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_mark_read" }, async ($, e) => {
     return { result: await markReadText($, { id: e.id, all: e.all === true }) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_mark_read", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_adopt" }, async ($, e) => {
     return { result: await adoptThreads($, { ids: Array.isArray(e.ids) ? e.ids : [], all: e.all === true }) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_adopt", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_plan_history" }, async ($, e) => {
     return { result: await planHistoryText($, e.planId) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_plan_history", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_pin" }, async ($, e) => {
     await refresh($);
     const found = await findThread($, e.id);
     if (found.error) return { deny: found.error };
     return { result: await setFlag($, found.thread, "pinned", e.pinned !== false) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_pin", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_archive" }, async ($, e) => {
     await refresh($);
     const found = await findThread($, e.id, { includeArchived: true });
     if (found.error) return { deny: found.error };
     return { result: await setFlag($, found.thread, "archived", e.archived !== false) };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_archive", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_setup" }, async ($, e) => {
     const out = await runSetup($, { cwd: e.cwd, closeStale: e.close_stale === true });
     return { result: out.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_setup", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_plan" }, async ($, e) => {
     startTicker($);
@@ -365,13 +381,13 @@ export function register(on, options) {
     const made = await createPlan($, e);
     if (made.error) return { deny: made.error };
     return { result: made.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_plan", next) }));
 
   on("tool.call", { tool: "mcp__threads__threads_plan_advance" }, async ($, e) => {
     const out = await advancePlan($, e.planId, e.decision, e.feedback, { quiet: false });
     if (out.error) return { deny: out.error };
     return { result: out.text };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: toolFailure("threads_plan_advance", next) }));
 
   // ---- inline threads: what their loops do -----------------------------------------
   //
@@ -402,7 +418,7 @@ export function register(on, options) {
       await noteAgent($, e.agentId, { needsYou: false, lastAt: now });
     }
     return ran;
-  });
+  }).catch(passThrough);
 
   // A permission decision for one of an inline thread's calls: an "ask" means it waits on the person.
   on("tool.check", async ($, e, next) => {
@@ -423,7 +439,7 @@ export function register(on, options) {
       $.ui.toast(`${title} needs you: asks to run ${clip(toolLine(e.tool, e.input), 80)}`, { timeoutMs: 8000 });
     }
     return decided;
-  });
+  }).catch(passThrough);
 
   on("turn.step", async function* ($, e, next) {
     let tid = e.agentId ? await inlineThreadOf($, e.agentId) : undefined;
@@ -457,7 +473,7 @@ export function register(on, options) {
       const c = costOfUsage(result.usage, model, "sub");
       await update($, AGENTS, (all) => {
         const cur = (all ?? {})[e.agentId] ?? {};
-        return { ...(all ?? {}), [e.agentId]: { ...cur, costUsd: (cur.costUsd ?? 0) + c.usd } };
+        return { ...(all ?? {}), [e.agentId]: { ...cur, costUsd: (cur.costUsd ?? 0) + c.usd, ...(c.isPriced ? {} : { costUnpriced: (cur.costUnpriced ?? 0) + 1 }) } };
       });
     }
     if (result?.answer && result.answer.trim()) {
@@ -485,7 +501,7 @@ export function register(on, options) {
       }
     }
     return next(e);
-  });
+  }).catch(passThrough);
 
   on("turn.complete", async ($, e, next) => {
     const result = await next(e);
@@ -516,7 +532,7 @@ export function register(on, options) {
       $.ui.log(`threads: could not record a report (${String(err?.message ?? err)})`, { to: "debug" });
     }
     return next(e);
-  });
+  }).catch(passThrough);
 
   // ---- drawing -------------------------------------------------------------------------
 
@@ -674,11 +690,11 @@ export function register(on, options) {
     const plan = ui.planView ? (ui.planIndex ? plans[planAt] : plans.find((x) => x.id === selected?.planId) ?? plans[planAt]) : null;
     if (plan) {
       const byId = new Map(view.threads.map((x) => [x.id, x]));
-      const color = { working: "yellow", "awaiting-gate": "magenta", revising: "cyan", blocked: "red", done: "green", accepted: "green", queued: undefined };
-      const planCost = plan.phases.reduce((a, ph) => a + (byId.get(ph.threadId)?.costUsd ?? 0), 0);
+      const color = { working: "yellow", "awaiting-gate": "magenta", revising: "cyan", blocked: "red", interrupted: "red", done: "green", accepted: "green", queued: undefined };
+      const planCost = sumCosts(plan.phases.filter((ph) => ph.threadId).map((ph) => byId.get(ph.threadId) ?? {}));
       const isHistory = plan.status !== "running";
       right.push(Text({ bold: true, wrap: "truncate", children: clip(`Plan ${plan.title} (${plan.id}) · ${plan.status} · gate ${plan.gate}${isHistory ? " · history (read-only)" : ""}`, rightW) }));
-      right.push(dim(`est. API-equivalent ${paneMoney(planCost)} · ${plan.phases.length} phases`, rightW));
+      right.push(dim(`${paneCost({ costUsd: planCost.usd ?? (planCost.unpriced ? undefined : 0), costUnpriced: planCost.unpriced })} ${COST_LABEL} · ${plan.phases.length} phases`, rightW));
       if (plans.length > 1) {
         right.push(
           Box({
@@ -761,6 +777,10 @@ export function register(on, options) {
       } else if (t.status === "needs-you" && t.prompt) {
         alerts.push(Text({ color: "magenta", wrap: "truncate", children: clip(`waiting: ${oneLine(t.prompt)}`, rightW) }));
       }
+      if (t.status === "held-message") {
+        alerts.push(Text({ color: "magenta", wrap: "wrap", children: clip(`held message from another session${t.held ? `: ${oneLine(t.held)}` : ""}. Approving it is yours: in that thread (Open), or Deliver held message below for one this chat sent.`, rightW * 3) }));
+      }
+      if (t.status === "stuck") alerts.push(Text({ color: "red", wrap: "truncate", children: clip("No new transcript activity for 10 minutes: look at its screen, steer or interrupt it (a guess, not a verdict).", rightW) }));
       if (t.status === "needs-login") alerts.push(Text({ color: "red", wrap: "truncate", children: clip(LOGIN_HINT, rightW) }));
       if (t.status === "needs-trust") {
         alerts.push(Text({ color: "red", wrap: "truncate", children: clip("Sits on the folder trust prompt. Trust the folder yourself, then close and recreate.", rightW) }));
@@ -778,13 +798,13 @@ export function register(on, options) {
         }
       }
       details.push(field("Task", tidyPaths(oneLine(t.task), valueW, home)));
-      details.push(field("Cost", `${paneMoney(t.costUsd)} est. API-equivalent${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
+      details.push(field("Cost", `${paneCost(t)} ${COST_LABEL}${t.pinned ? " · pinned" : ""}${t.archived ? " · archived" : ""}`));
       if (t.lastReport?.text) details.push(field("Report", tidyPaths(oneLine(plainText(t.lastReport.text)), valueW, home), "cyan"));
       if (t.forkedFrom) details.push(field(t.handedOff ? "Handoff" : "Forked", `from "${t.forkedFrom.title}" with ${t.forkedFrom.include === "full" ? "its transcript" : "a summary"}`));
       if (t.desktop?.length) details.push(field("Desk", `drives ${t.desktop.join(", ")} through Codex computer use (leased to this thread)`));
       if (t.worktree) {
         const w = t.worktree;
-        const state = w.removed ? "removed (no changes)" : w.kept ? `kept${w.commits ? `, ${w.commits} commit${w.commits === 1 ? "" : "s"}` : ""}${w.dirty ? ", uncommitted changes" : ""} · merge: git merge ${w.branch}` : "isolated";
+        const state = w.removed ? "removed (no changes)" : w.kept ? `kept${w.commits ? `, ${w.commits} commit${w.commits === 1 ? "" : "s"}` : ""}${w.dirty ? ", uncommitted changes to review" : ""}${w.commits ? ` · merge: git merge ${w.branch}` : ""}` : w.mismatch ? `check: ${w.mismatch}` : "isolated";
         details.push(field("Worktree", `${w.branch} · ${state}`));
       }
 
@@ -797,6 +817,8 @@ export function register(on, options) {
             btn("approve", "Approve", "y", () => noticeOf($, () => answerPrompt($, t, true)), { variant: "primary" }),
             btn("deny", "Deny", "n", () => noticeOf($, () => answerPrompt($, t, false))),
           ]
+        : t.status === "held-message" && !isInline
+          ? [btn("deliver-held", "Deliver held message", "y", () => noticeOf($, () => deliverHeld($, t)), { variant: "primary" }), steer]
         : isLive
           ? [steer, interrupt]
           : [];
@@ -1014,7 +1036,8 @@ async function registerTools($) {
       "Create a thread: a real, separate Claude Code session on a chosen model that works on a task in the background, " +
       "which the user can watch (/threads) and you can steer and monitor. Use it when the user asks to spin up, start, or create " +
       "a thread, worker or session on a model (\"spin up a Haiku thread to triage the inbox\"). One call per thread. " +
-      "By default the thread sends you a short report when it finishes or gets stuck; it reaches you as a cross-session message. " +
+      "When it finishes, the watcher reads its transcript and puts its final answer here once, as a short report. " +
+      "It appears in the desktop sidebar only once Remote Control reports a link for it (bridgeSessionId); the result says whether a link was seen. " +
       "Models: haiku, sonnet, opus, fable, or a full claude-* id. Session threads run with bypassed permissions by default (they never stop for approval); pass permission_mode to change one, or /threads mode for all.",
     inputSchema: {
       type: "object",
@@ -1024,14 +1047,14 @@ async function registerTools($) {
         task: { type: "string", description: "The thread's task, written as a complete first prompt" },
         cwd: { type: "string", description: "Folder to work in (default: this chat's folder). Must be a trusted folder." },
         permission_mode: { type: "string", enum: ["bypassPermissions", "default", "acceptEdits", "plan", "auto"], description: "Permission mode for a session thread (default bypassPermissions, or what /threads mode set). bypassPermissions is refused unless that default is already bypass. Inline threads use this chat's mode." },
-        report_back: { type: "boolean", description: "Ask the thread to message a short report back to this chat (default true)" },
+        report_back: { type: "boolean", description: "Put the thread's final answer in this chat as a report when it finishes (default true); the watcher reads it from its transcript" },
         effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"], description: "Reasoning effort (default: the model's)" },
         worktree: { type: "boolean", description: "Run it in its own git worktree and branch (the folder must be in a git repo), so parallel threads never edit the same files. Use when the user asks for isolation, a worktree or a separate branch, or when several threads will edit the same repo at once" },
         backend: {
           type: "string",
           enum: ["auto", "session", "inline"],
           description:
-            "session: its own Claude Code process (needs the terminal CLI login; shows in the sidebar via Remote Control). inline: a background agent of this chat on this chat's login. auto (default): session when the CLI is logged in, else inline.",
+            "session: its own Claude Code process (needs the terminal CLI login; in the desktop sidebar once Remote Control reports a link). inline: a background agent of this chat on this chat's login; use it only when the user asks for it. auto (default): a session; when the CLI is not logged in it returns the fix instead of switching to inline.",
         },
       },
       required: ["model", "title", "task"],
@@ -1058,14 +1081,16 @@ async function registerTools($) {
   await $.tool.register({
     name: T_SEND,
     description:
-      "Steer a thread. mode message (default) delivers a message the thread reads even mid-task; mode type types the text " +
-      "into its prompt and presses Enter (use for slash commands); mode interrupt presses Escape to stop its current step.",
+      "Steer a thread. mode message (default) delivers a message the thread reads even mid-task; when its session refuses it, the result says \"not delivered\" and why. " +
+      "mode type types the text into its prompt and presses Enter (for slash commands the user asked for, never to get around a refused message); mode interrupt presses Escape to stop its current step. " +
+      "A message the thread holds for approval stays held: only the person approves it, in that thread or with the pane's button.",
     inputSchema: {
       type: "object",
       properties: {
         id: idProp,
         message: { type: "string", description: "What to send or type (ignored for interrupt)" },
         mode: { type: "string", enum: ["message", "type", "interrupt"] },
+        force: { type: "boolean", description: "Only when the person asked for it after a refusal: type a refused message into the thread's prompt instead. Never set it on your own" },
       },
       required: ["id"],
     },
@@ -1100,7 +1125,7 @@ async function registerTools($) {
         cwd: { type: "string", description: "Project folder (default: this chat's); must be trusted for session threads" },
         gate: { type: "string", enum: ["auto", "lead", "user"] },
         handoff_dir: { type: "string", description: "Where handoff files go (default <cwd>/handoff)" },
-        backend: { type: "string", enum: ["auto", "session", "inline"], description: "Default auto: session when the terminal CLI is logged in" },
+        backend: { type: "string", enum: ["auto", "session", "inline"], description: "Default auto: session threads; without the terminal CLI login it returns the fix, never inline on its own. inline only when the user asks" },
         keep_threads: { type: "boolean", description: "Keep every phase thread open until you close it (default false: an accepted phase's thread closes once the next phase is under way)" },
         phases: {
           type: "array",
@@ -1208,12 +1233,12 @@ async function registerTools($) {
   });
   await $.tool.register({
     name: T_PIN,
-    description: "Pin a thread (pinned: true, default) so it stays on top and is never cleaned up or idle-closed; pinned: false unpins.",
+    description: "Pin a thread (pinned: true, default) so it stays on top and is never cleaned up or idle-closed; pinned: false unpins. Threads panel only; does not change the app's native sidebar.",
     inputSchema: { type: "object", properties: { id: idProp, pinned: { type: "boolean" } }, required: ["id"] },
   });
   await $.tool.register({
     name: T_ARCHIVE,
-    description: "Archive a thread (archived: true, default) to hide it from the pane and threads_list; archived: false brings it back.",
+    description: "Archive a thread (archived: true, default) to hide it from the pane and threads_list; archived: false brings it back. Threads panel only; does not change the app's native sidebar.",
     inputSchema: { type: "object", properties: { id: idProp, archived: { type: "boolean" } }, required: ["id"] },
   });
   await $.tool.register({
@@ -1315,6 +1340,11 @@ async function loadRegistry($, p) {
     text = null;
   }
   const parsed = parseRegistry(text);
+  if (parsed.isReadOnly && !readOnlyWarned) {
+    readOnlyWarned = true;
+    await logEvent($, p, "registry-newer", { version: parsed.registry.version });
+    $.ui.toast(`Threads: the registry is format ${parsed.registry.version}, newer than this mod (1). It is read-only here: update the mod (claude plugin update threads@two-mods) before creating or changing threads.`, { timeoutMs: 10000 });
+  }
   if (parsed.isCorrupt) {
     const now = await $.clock.now();
     const backup = `${p.registry}.corrupt-${now}`;
@@ -1325,7 +1355,16 @@ async function loadRegistry($, p) {
   return parsed.registry;
 }
 
+// Nothing new starts while the registry is a newer format: it could not be recorded, so it would be lost.
+async function registryReadOnly($) {
+  const reg = await loadRegistry($, await paths($));
+  return Number(reg.version) > 1 ? `The threads registry is format ${reg.version}, newer than this mod understands (1), so it is read-only here and nothing was started. Update the mod: claude plugin update threads@two-mods.` : "";
+}
+
+// a registry a newer mod wrote is never rewritten in the older format (loadRegistry warned once)
+let readOnlyWarned = false;
 async function saveRegistry($, p, reg) {
+  if (Number(reg.version) > 1) return;
   await ensureDir($, p);
   const now = await $.clock.now();
   const tmp = `${p.registry}.tmp-${now}-${Math.floor(Math.random() * 1e6)}`;
@@ -1577,7 +1616,8 @@ async function doRefresh($) {
       }
       // only a full model id counts as verified, never the alias the spawn echoed
       if (meta?.model && meta.model !== t.verifiedModel && /^claude-/.test(meta.model)) patch.verifiedModel = meta.model;
-      if (meta?.costUsd !== undefined && Math.abs(meta.costUsd - (t.costUsd ?? 0)) >= 0.0005) patch.costUsd = Number(meta.costUsd.toFixed(5));
+      if (meta?.costUsd !== undefined && (t.costUsd === undefined || Math.abs(meta.costUsd - t.costUsd) >= 0.0005)) patch.costUsd = Number(meta.costUsd.toFixed(5));
+      if (meta?.costUnpriced && meta.costUnpriced !== (t.costUnpriced ?? 0)) patch.costUnpriced = meta.costUnpriced;
       if (Object.keys(patch).length && (isMine || patch.status === "exited")) patches.set(t.id, { patch, from: t });
       rows.push({
         ...t,
@@ -1599,6 +1639,18 @@ async function doRefresh($) {
     let verified = t.verifiedModel ?? "";
     if (t.status !== "closed") {
       if (pane && !pane.isDead) screen = readScreen(await capture($, t.tmux, false));
+      // the transcript first: its newest row's time tells working from stuck
+      let lastAt = 0;
+      if (pane || !verified) {
+        const parsed = parseTranscript(await transcriptTail($, p, t, "131072"));
+        if (parsed.model) verified = parsed.model;
+        lastAt = parsed.lastAt;
+        const last = parsed.items[parsed.items.length - 1];
+        if (last) {
+          lastLine = itemLine(last);
+          lastKind = last.kind;
+        }
+      }
       status = statusOf({
         previous: t.status,
         tmux: { isLive: Boolean(pane), isDead: Boolean(pane?.isDead) },
@@ -1607,16 +1659,8 @@ async function doRefresh($) {
         screen,
         now,
         createdAt: t.createdAt,
+        lastAt,
       });
-      if (pane || !verified) {
-        const parsed = parseTranscript(await transcriptTail($, p, t, "131072"));
-        if (parsed.model) verified = parsed.model;
-        const last = parsed.items[parsed.items.length - 1];
-        if (last) {
-          lastLine = itemLine(last);
-          lastKind = last.kind;
-        }
-      }
     }
     const patch = {};
     if (status !== t.status) {
@@ -1625,8 +1669,9 @@ async function doRefresh($) {
     }
     if (verified && verified !== t.verifiedModel) patch.verifiedModel = verified;
     if (t.status !== "closed" || t.costUsd === undefined) {
-      const usd = await sessionCost($, p, t);
-      if (usd !== null && Math.abs(usd - (t.costUsd ?? 0)) >= 0.0005) patch.costUsd = Number(usd.toFixed(5));
+      const cost = await sessionCost($, p, t);
+      if (cost && (t.costUsd === undefined || Math.abs(cost.usd - t.costUsd) >= 0.0005)) patch.costUsd = Number(cost.usd.toFixed(5));
+      if (cost && cost.unpriced !== (t.costUnpriced ?? 0)) patch.costUnpriced = cost.unpriced;
     }
     if (sess) {
       if (sess.pid && sess.pid !== t.pid) patch.pid = sess.pid;
@@ -1642,6 +1687,7 @@ async function doRefresh($) {
       lastLine,
       lastKind,
       prompt: screen?.prompt ?? "",
+      held: screen?.heldPreview ?? "",
       desktop: desktopOf(desk, t, lead.selfId),
     });
   }
@@ -1759,6 +1805,8 @@ async function createThread($, input) {
   const eff = checkEffort(input.effort);
   if (eff.error) return { error: eff.error };
   const extra = input.extra ?? {};
+  const readOnly = await registryReadOnly($);
+  if (readOnly) return { error: readOnly };
   const permissionMode = mode.mode ?? (await defaultMode($));
   const setupNote = input.extra?.planId ? "" : await setupOnFirstUse($);
   const made = await createThreadChecked($, input, { m, title, task, mode, eff, extra, permissionMode });
@@ -1793,17 +1841,15 @@ async function createThreadChecked($, input, { m, title, task, mode, eff, extra,
     input = { ...input, worktreeBase: head.stdout.trim() };
   }
 
-  // auto: a real session when the terminal login works, else an inline subagent
+  // auto is a real session; without the terminal login it refuses with the fix and never switches to inline on its own
   let backend = requested;
   let authNote = "";
   if (requested !== "inline") {
     const auth = await authStatus($);
-    const chosen = chooseBackend(requested, auth.loggedIn);
+    const chosen = chooseBackend(requested);
     backend = chosen.backend;
-    if (backend === "session" && !auth.loggedIn) {
-      return { error: `${LOGIN_HINT} (claude auth status says ${auth.detail || "not logged in"}). Or use an inline thread (--inline, backend inline), which runs inside this chat.` };
-    }
-    if (chosen.isAuto) authNote = auth.loggedIn ? "auto picked a session because the terminal login works" : "auto picked inline because the terminal CLI is not logged in";
+    if (!auth.loggedIn) return { error: `${LOGIN_HINT} (claude auth status says ${auth.detail || "not logged in"}). ${INLINE_OFFER}` };
+    if (chosen.isAuto) authNote = "auto picked a session because the terminal login works";
   }
   if (backend === "inline") return createInline($, p, { model: m.model, title, task, cwd: real, here, reportBack: input.reportBack !== false, mode: mode.mode, authNote, effort: eff.effort, extra, context: input.context, repo, base: input.worktreeBase });
 
@@ -1891,20 +1937,27 @@ async function createThreadChecked($, input, { m, title, task, mode, eff, extra,
   });
 
   const early = await settle($, p, entry);
+  const wtCheck = wt && early.isRegistered ? await verifyWorktree($, p, entry) : "";
   await refresh($, { force: true });
   await startWatcher($);
   await patchUi($, (u) => (u.selected ? u : { ...u, selected: id }));
 
   const lines = [`Created ${title} (${id}) on ${m.model}${eff.effort ? ` (effort ${eff.effort})` : ""} in ${workCwd} as its own Claude Code session, permission mode ${permissionMode}.`];
-  if (wt) lines.push(`It works in its own git worktree on branch ${wt.branch}, so it cannot clash with other threads. When it closes, an unchanged worktree is removed; one with work is kept for you to merge.`);
+  if (wt) lines.push(`It works in its own git worktree on branch ${wt.branch}, so it never edits the same working files as other threads (merging can still conflict). When it closes, an unchanged worktree is removed; one with work is kept.`);
+  if (wtCheck) lines.push(wtCheck);
   if (authNote) lines.push(`Backend: ${authNote}.`);
   if (early.status === "needs-login") lines.push(`It is stuck on the login screen. ${LOGIN_HINT}`);
   else if (early.status === "needs-trust") lines.push("It is stuck on the folder trust prompt.");
   else if (early.status === "exited") lines.push(`It exited right away: ${clip(early.screen, 300) || "no output"}`);
   else if (early.isRegistered) lines.push("It is running.");
   else lines.push("It is starting.");
-  if (reportBack && !lead.socket) lines.push("This chat's messaging address was not found, so the thread cannot report back; watch it with /threads.");
-  else if (reportBack) lines.push("It will message a short report back here when it finishes or gets stuck.");
+  // the sidebar: only a Remote Control link says it is there
+  const linked = (await scanSessions($, p)).get(sessionId)?.bridgeSessionId ?? "";
+  if (linked) {
+    await patchThread($, p, id, { bridgeSessionId: linked });
+    lines.push(`Remote Control reported a link (${linked}), so it shows in the desktop sidebar.`);
+  } else lines.push("No Remote Control link seen yet, so it is not in the desktop sidebar yet; the Threads pane shows it either way.");
+  if (reportBack) lines.push("When it finishes, the watcher reads its transcript and puts its final answer here as a report.");
   lines.push(`Watch: /threads · Steer: /threads send ${id} <message> · Close: /threads close ${id}`);
   return { text: lines.join("\n"), id };
 }
@@ -2021,6 +2074,25 @@ async function createInline($, p, { model, title, task, cwd, here, reportBack, m
   return { text: lines.join("\n"), id };
 }
 
+// A worktree thread, once it registered: is it really on its branch, in its folder? A mismatch is reported and the real
+// values saved beside the expected ones (never over them: cleanup must not delete a branch or folder it did not make).
+async function verifyWorktree($, p, entry) {
+  const w = entry.worktree;
+  const head = await run($, ["git", "-C", w.path, "rev-parse", "--abbrev-ref", "HEAD"], 5000);
+  const branch = head.exitCode === 0 ? head.stdout.trim() : "";
+  const cwd = (await scanSessions($, p)).get(entry.sessionId)?.cwd ?? "";
+  const problems = [];
+  if (branch !== w.branch) problems.push(`branch is ${branch || "unknown (git could not read it)"}, not ${w.branch}`);
+  if (cwd && cwd !== w.path) problems.push(`its session runs in ${cwd}, not ${w.path}`);
+  if (problems.length === 0) {
+    await logEvent($, p, "worktree-verified", { id: entry.id, branch, cwd: cwd || w.path });
+    return `Verified: branch ${branch}${cwd ? `, session folder ${cwd}` : ""}.`;
+  }
+  await patchThread($, p, entry.id, { worktree: { ...w, actual: { branch, cwd }, mismatch: problems.join("; ") } });
+  await logEvent($, p, "worktree-mismatch", { id: entry.id, expected: { branch: w.branch, path: w.path }, actual: { branch, cwd } });
+  return `Worktree check failed: ${problems.join("; ")}. Saved the real values; it will not be cleaned up automatically, so check it before relying on the isolation.`;
+}
+
 // A few seconds after the spawn: did it register, or is it stuck on a login or trust screen?
 async function settle($, p, entry) {
   for (let i = 0; i < 8; i++) {
@@ -2049,7 +2121,7 @@ async function settle($, p, entry) {
 
 // ---- steering ---------------------------------------------------------------------------------------------
 
-async function sendToThread($, t, text) {
+async function sendToThread($, t, text, opts = {}) {
   const isInline = t.backend === "inline";
   // a finished inline agent is resumed by the message, so idle-and-done still counts
   if (!LIVE.has(t.status) && !(isInline && t.status === "exited" && t.isMine)) return `${t.id} is ${t.status}; nothing sent.`;
@@ -2063,12 +2135,11 @@ async function sendToThread($, t, text) {
   const p = await paths($);
   await logEvent($, p, "message-sent", { id: t.id, delivered: result.isDelivered, reason: result.reason ?? "", text: clip(text, 500) });
   if (!result.isDelivered) {
-    // a session thread is our own tmux session: when the message channel refuses (a held class, an
-    // auto-mode classifier with no verdict), type it into its prompt instead, unless a dialog is up
+    // a refusal is a decision: typing around it happens only when the person asked (force), never on its own
     const gone = /not running|no such|not found|unknown session|has ended/i.test(String(result.reason ?? ""));
-    if (!isInline && !gone && (t.status === "idle" || t.status === "working")) {
+    if (opts.force && !isInline && !gone && (t.status === "idle" || t.status === "working" || t.status === "stuck")) {
       const typed = await typeFallback($, p, t, text);
-      if (typed) return `Sent to ${shortTitle(t.title)} (${t.id}) by typing it into its prompt (the message channel refused: ${clip(oneLine(result.reason ?? ""), 160)}): ${clip(oneLine(text), 120)}`;
+      if (typed) return `Sent to ${shortTitle(t.title)} (${t.id}) by typing it into its prompt, as asked (the message channel refused: ${clip(oneLine(result.reason ?? ""), 160)}): ${clip(oneLine(text), 120)}`;
     }
     return `Not delivered to ${shortTitle(t.title)} (${t.id}): ${result.reason}`;
   }
@@ -2080,13 +2151,13 @@ async function sendToThread($, t, text) {
   const at = await $.clock.now();
   await update($, SENT, (cur) => ({ ...(cur ?? {}), [t.id]: { text, at } }));
   await startWatcher($);
-  // the thread's Claude Code may hold it (different permission class); if it shows our text, deliver it
+  // the thread's Claude Code may hold it (different permission class): that approval is the person's, never pressed here
   await run($, ["sleep", "1.5"], 5000);
   const screen = readScreen(await capture($, t.tmux, false));
   if (screen.heldMessage) {
-    const delivered = await deliverHeld($, p, t, screen);
-    return delivered
-      ? `Sent to ${shortTitle(t.title)} (${t.id}): ${clip(oneLine(text), 120)} (it was held by that session; delivered it)`
+    const ours = await heldIsOurs($, t, screen);
+    return ours
+      ? `Sent to ${shortTitle(t.title)} (${t.id}), but that session holds it for approval (status held-message). ${HELD_HELP}`
       : `Sent to ${shortTitle(t.title)} (${t.id}), but it shows a held message that does not match; left it for you (status held-message).`;
   }
   return `Sent to ${shortTitle(t.title)} (${t.id}): ${clip(oneLine(text), 120)}`;
@@ -2335,7 +2406,7 @@ async function finishWorktree($, p, t) {
   await run($, ["git", "-C", w.repo, "worktree", "unlock", w.path], 5000);
   const st = await run($, ["git", "-C", w.path, "status", "--porcelain"], 10000);
   const ahead = await run($, ["git", "-C", w.repo, "rev-list", "--count", `${w.base}..${w.branch}`], 10000);
-  const out = worktreeOutcome({ statusOk: st.exitCode === 0 && ahead.exitCode === 0, porcelain: st.stdout, commits: Number(String(ahead.stdout).trim()) || 0 });
+  const out = worktreeOutcome({ statusOk: st.exitCode === 0 && ahead.exitCode === 0 && !w.mismatch, porcelain: st.stdout, commits: Number(String(ahead.stdout).trim()) || 0 });
   if (out.remove) {
     const ok = await removeWorktree($, w);
     await patchThread($, p, t.id, { worktree: { ...w, removed: ok } });
@@ -2344,8 +2415,16 @@ async function finishWorktree($, p, t) {
   }
   await patchThread($, p, t.id, { worktree: { ...w, kept: true, commits: out.commits, dirty: out.dirty } });
   await logEvent($, p, "worktree-kept", { id: t.id, path: w.path, commits: out.commits, dirty: out.dirty });
-  const what = [out.commits ? `${out.commits} commit${out.commits === 1 ? "" : "s"}` : "", out.dirty ? "uncommitted changes" : ""].filter(Boolean).join(" and ");
-  return ` Its worktree is kept at ${w.path} on branch ${w.branch} (${what}). Merge it with: git -C '${w.repo}' merge ${w.branch}`;
+  // a merge command only for committed work; uncommitted changes need a person's review first
+  const parts = [` Its worktree is kept at ${w.path} on branch ${w.branch}.`];
+  if (w.mismatch) parts.push(` It did not match what was set up (${w.mismatch}), so nothing was removed.`);
+  if (out.commits) parts.push(` ${out.commits} commit${out.commits === 1 ? "" : "s"} ahead; merge with: git -C '${w.repo}' merge ${w.branch}`);
+  if (out.dirty) {
+    const lines = String(st.stdout).split("\n").filter((l) => l.trim());
+    parts.push(` Uncommitted changes in ${w.path} need review and a commit first:\n${lines.slice(0, 5).map((l) => `  ${l}`).join("\n")}${lines.length > 5 ? `\n  … and ${lines.length - 5} more` : ""}`);
+  }
+  if (!out.commits && !out.dirty && !w.mismatch) parts.push(" Its status could not be read, so it was kept.");
+  return parts.join("");
 }
 
 async function closeThread($, t, opts = {}) {
@@ -2375,6 +2454,7 @@ async function closeNow($, t) {
     const now = await $.clock.now();
     await patchThread($, p, t.id, { status: "closed", closedAt: now });
     await logEvent($, p, "closed", { id: t.id, backend: "inline", previous: t.status });
+    if (t.planId) await phaseInterrupted($, p, t, "closed while it ran", { quiet: true });
     await releaseDesktop($, p, t);
     const tree = await finishWorktree($, p, t);
     await refresh($, { force: true });
@@ -2384,6 +2464,7 @@ async function closeNow($, t) {
   const now = await $.clock.now();
   await patchThread($, p, t.id, { status: "closed", closedAt: now });
   await logEvent($, p, "closed", { id: t.id, previous: t.status });
+  if (t.planId) await phaseInterrupted($, p, t, "closed while it ran", { quiet: true });
   await releaseDesktop($, p, t);
   const tree = await finishWorktree($, p, t);
   await refresh($, { force: true });
@@ -2419,6 +2500,7 @@ async function closePlanThreads($, plan, opts = {}) {
     if (t.backend === "inline") await stopInline($, { ...t, isMine: true });
     else await run($, tmuxArgv("kill-session", "-t", t.tmux), 5000);
     await patchThread($, p, id, { status: "closed", closedAt: await $.clock.now() });
+    await phaseInterrupted($, p, t, "closed while it ran", { quiet: true });
     await releaseDesktop($, p, t);
     await finishWorktree($, p, t);
   }
@@ -2508,8 +2590,8 @@ async function noteInlineDone($, e) {
 // Reports must not depend on the thread's model calling SendMessage. While any of
 // this chat's session threads is live, every 4 s: read each one's status; on a
 // change to idle (or exit) take its latest answer from the transcript and report
-// it; on a change to needs-you or held-message, toast it. A held copy of a message
-// this chat just sent is delivered (Down, then Enter).
+// it; on a change to needs-you or held-message, toast it. A held message is never
+// approved here: the person does that in the thread or with the pane's button.
 
 async function startWatcher($) {
   if (watcher) return;
@@ -2547,7 +2629,10 @@ async function watchOnce($, opts = {}) {
   const p = await paths($);
   const reg = await loadRegistry($, p);
   const selfId = await $.session.id();
-  const mine = reg.threads.filter((t) => t.parent?.sessionId === selfId && t.backend !== "inline" && LIVE.has(t.status));
+  const { value: prev = {} } = await $.state.get(WATCH);
+  // a refresh may have marked one exited before this pass saw it go: it still gets its exit handled once
+  const justExited = (t) => t.status === "exited" && prev[t.id] !== undefined && prev[t.id] !== "exited";
+  const mine = reg.threads.filter((t) => t.parent?.sessionId === selfId && t.backend !== "inline" && (LIVE.has(t.status) || justExited(t)));
   const waiting = (reg.plans ?? []).filter((pl) => pl.lead?.sessionId === selfId && pl.status === "running" && pl.phases[pl.current ?? 0]?.status === "queued");
   await retireWaitingPredecessors($, p, { ...reg, plans: (reg.plans ?? []).filter((pl) => pl.lead?.sessionId === selfId) });
   for (const pl of waiting) await startPhase($, p, pl.id, pl.current ?? 0, opts);
@@ -2559,48 +2644,48 @@ async function watchOnce($, opts = {}) {
   const panes = await livePanes($);
   const now = await $.clock.now();
   await closeIdleThreads($, p, reg, sessions, now);
-  const { value: prev = {} } = await $.state.get(WATCH);
   const seen = { ...prev };
   for (const t of mine) {
     const pane = panes.get(t.tmux);
     const sess = sessions.get(t.sessionId) ?? null;
     const screen = pane && !pane.isDead ? readScreen(await capture($, t.tmux, false)) : null;
-    let status = statusOf({ previous: t.status, tmux: { isLive: Boolean(pane), isDead: Boolean(pane?.isDead) }, session: sess, pidAlive: undefined, screen, now, createdAt: t.createdAt });
-    if (status === "held-message" && (await deliverHeld($, p, t, screen))) status = "working";
+    const status = statusOf({ previous: t.status, tmux: { isLive: Boolean(pane), isDead: Boolean(pane?.isDead) }, session: sess, pidAlive: undefined, screen, now, createdAt: t.createdAt });
     const was = prev[t.id];
     seen[t.id] = status;
     if (status === was) continue;
     if ((status === "needs-you" || status === "held-message") && was !== status) {
-      const what = status === "held-message" ? `a held message waits (${clip(screen?.heldPreview ?? "", 60)})` : clip(oneLine(screen?.prompt ?? "a permission prompt"), 80);
+      const what = status === "held-message" ? `a held message waits for your approval (${clip(screen?.heldPreview ?? "", 60)})` : clip(oneLine(screen?.prompt ?? "a permission prompt"), 80);
       $.ui.toast(`${t.title} needs you: ${what}`, { timeoutMs: 8000 });
       await logEvent($, p, status, { id: t.id, detail: clip(what, 300) });
     }
     if (status === "idle" || status === "exited") {
       const parsed = parseTranscript(await transcriptTail($, p, t));
+      let delivered = false;
       if (parsed.lastAnswer && parsed.isAnswerLatest) {
-        await deliverReport($, p, t, {
+        delivered = await deliverReport($, p, t, {
           answer: parsed.lastAnswer.text,
           key: parsed.lastAnswer.key,
+          answerAt: parsed.lastAnswer.at,
           model: parsed.model || t.verifiedModel || t.requestedModel,
           source: "watcher",
           quiet: opts.quiet === true,
         });
-        if (t.planId) await phaseFinished($, p, t, opts);
       }
+      // a phase helper that died, was killed or closed with no new final answer: interrupted, never done
+      if (t.planId && status === "exited" && !delivered) await phaseInterrupted($, p, t, "its helper exited before a new final answer", opts);
+      else if (t.planId && parsed.lastAnswer && parsed.isAnswerLatest) await phaseFinished($, p, t, opts);
     }
   }
   await $.state.set(WATCH, seen);
 }
 
 // Records a finished thread's answer once, tells the person, and puts it in front of the lead's model.
-async function deliverReport($, p, t, { answer, key, model, source, quiet = false }) {
+async function deliverReport($, p, t, { answer, key, answerAt = 0, model, source, quiet = false }) {
   const now = await $.clock.now();
   const fresh = (await loadRegistry($, p)).threads.find((x) => x.id === t.id) ?? t;
-  const decision = shouldReport({ lastReport: fresh.lastReport, appendedKey: fresh.appendedKey, key, now });
-  if (!decision.report) {
-    if (decision.reason === "the thread reported itself") await patchThread($, p, t.id, { appendedKey: key });
-    return false;
-  }
+  // skipped answers are not marked appended, so a mid-task note can never stand in for one
+  const decision = shouldReport({ lastReport: fresh.lastReport, appendedKey: fresh.appendedKey, key, now, answer, answerAt });
+  if (!decision.report) return false;
   const text = clip(String(answer ?? "").trim(), ANSWER_MAX);
   const patch = { lastReport: { at: now, text, source }, appendedKey: key };
   if (/^claude-/.test(model ?? "")) patch.verifiedModel = model;
@@ -2627,12 +2712,26 @@ async function deliverReport($, p, t, { answer, key, model, source, quiet = fals
   return true;
 }
 
-// A message this chat sent that the thread's Claude Code is holding: deliver it if the preview matches.
-async function deliverHeld($, p, t, screen) {
+const HELD_HELP = "The person approves it: in that thread (Open), or with Deliver held message in the Threads pane.";
+
+// Is the held message on screen the one this chat sent in the last ten minutes?
+async function heldIsOurs($, t, screen) {
   const { value: sent = {} } = await $.state.get(SENT);
   const mine = sent[t.id];
   const now = await $.clock.now();
-  if (!mine || now - mine.at > 600000 || !heldMatches(screen?.heldPreview ?? "", mine.text)) return false;
+  return Boolean(mine) && now - mine.at <= 600000 && heldMatches(screen?.heldPreview ?? "", mine.text);
+}
+
+// The pane's Deliver held message button, which only the person can press: deliver this chat's own held message
+// (Down to "Deliver", then Enter). The model has no route here; a held message from anyone else is never delivered.
+async function deliverHeld($, t) {
+  if (t.backend === "inline" || !t.tmux) return `${shortTitle(t.title)} has no held message.`;
+  const screen = readScreen(await capture($, t.tmux, false));
+  if (!screen.heldMessage) return `${shortTitle(t.title)} is not holding a message.`;
+  if (!(await heldIsOurs($, t, screen))) return `The held message in ${shortTitle(t.title)} is not one this chat sent; open the thread and decide there.`;
+  const p = await paths($);
+  const { value: sent = {} } = await $.state.get(SENT);
+  const mine = sent[t.id];
   await run($, tmuxArgv("send-keys", "-t", t.tmux, "Down"), 5000);
   await run($, ["sleep", "0.3"], 3000);
   await run($, tmuxArgv("send-keys", "-t", t.tmux, "C-m"), 5000);
@@ -2641,8 +2740,9 @@ async function deliverHeld($, p, t, screen) {
     delete next[t.id];
     return next;
   });
-  await logEvent($, p, "held-delivered", { id: t.id, text: clip(mine.text, 300) });
-  return true;
+  await logEvent($, p, "held-delivered", { id: t.id, by: "person", text: clip(mine.text, 300) });
+  await refresh($, { force: true });
+  return `Delivered the held message to ${shortTitle(t.title)}.`;
 }
 
 // ---- cost -----------------------------------------------------------------------------------------------------------
@@ -2660,20 +2760,33 @@ async function sessionCost($, p, t) {
   if (!st || st.kind !== "file") return null;
   const { value: cache = {} } = await $.state.get(COST);
   const hit = cache[t.id];
-  if (hit && hit.size === st.size) return hit.usd;
+  if (hit && hit.size === st.size) return { usd: hit.usd, unpriced: hit.unpriced ?? 0 };
   let text = "";
   try {
     text = await $.fs.read(path);
   } catch {
-    return hit?.usd ?? null;
+    return hit ? { usd: hit.usd, unpriced: hit.unpriced ?? 0 } : null;
   }
-  const { usd } = costFromTranscript(text);
-  await update($, COST, (cur) => ({ ...(cur ?? {}), [t.id]: { size: st.size, usd } }));
-  return usd;
+  const { usd, unpriced } = costFromTranscript(text);
+  await update($, COST, (cur) => ({ ...(cur ?? {}), [t.id]: { size: st.size, usd, unpriced } }));
+  return { usd, unpriced };
 }
 
+// A thread's cost for the model-facing text: unknown says so instead of $0, and unpriced usage makes it a floor.
 function costChip(t) {
-  return t.costUsd ? money(t.costUsd) : "";
+  return costText(t.costUsd, t.costUnpriced);
+}
+
+function costLine(t, label = "est. API-equivalent") {
+  const c = costChip(t);
+  return c === "cost unavailable" ? c : `${c} ${label}`;
+}
+
+// The pane's shorter figure (whole cents), with the same unknown and floor rules.
+function paneCost(t) {
+  if (t.costUsd === undefined || t.costUsd === null) return "cost unavailable";
+  if (t.costUnpriced > 0) return t.costUsd > 0 ? `≥ ${paneMoney(t.costUsd)}, some usage unpriced` : "cost unavailable";
+  return paneMoney(t.costUsd);
 }
 
 // ---- show and open -------------------------------------------------------------------------------------------------
@@ -2750,6 +2863,7 @@ async function forkThread($, input) {
   const p = await paths($);
   const lead = await leadInfo($, p);
   let context;
+  let usedOutline = false;
   if (include === "summary") {
     // the whole conversation, outlined oldest first, steers the summary so early milestones are kept
     let rows = [];
@@ -2766,8 +2880,11 @@ async function forkThread($, input) {
     } catch {
       summary = "";
     }
-    // no fork available (a new chat, or the request failed): the outline itself
-    if (!summary && outline) summary = `Outline of the lead conversation, oldest first:\n${outline}`;
+    // no fork available (a new chat, or the request failed): the outline itself, labelled as such
+    if (!summary && outline) {
+      summary = `An outline of this chat (summary unavailable), oldest first:\n${outline}`;
+      usedOutline = true;
+    }
     if (!summary) return { error: "This chat has nothing to fork yet." };
     context = { summary: clip(summary, 10000) };
   } else {
@@ -2812,7 +2929,7 @@ async function forkThread($, input) {
     extra: { ...(input.extra ?? {}), forkedFrom: { sessionId: lead.selfId, title: lead.title, include, file: context.file ?? "" } },
   });
   if (made.error) return made;
-  return { ...made, text: `${made.text}\nForked from this chat with ${include === "full" ? `the transcript in ${context.file}` : "a summary of this conversation"}.` };
+  return { ...made, text: `${made.text}\nForked from this chat with ${include === "full" ? `the transcript in ${context.file}` : usedOutline ? "an outline of this chat (summary unavailable)" : "a summary of this conversation"}.` };
 }
 
 // ---- orphans and idle threads --------------------------------------------------------------------------------------
@@ -3014,7 +3131,8 @@ async function planHistoryText($, planId) {
   rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
   return [
     `Saved plans (${rows.length}), newest first:`,
-    ...rows.map((r) => `${r.id}  ${r.title} · ${r.status} · ${r.phases.length} phases (${r.phases.map((x) => `${x.name}:${x.verifiedModel || x.model}`).join(", ")}) · est. API-equivalent ${money(r.costUsd)} · ${localTime(r.createdAt, false)}`),
+    ...rows.map((r) => `${r.id}  ${r.title} · ${r.status} · ${r.phases.length} phases (${r.phases.map((x) => `${x.name}:${x.verifiedModel || x.model}`).join(", ")}) · ${costText(r.costUsd, r.costUnpriced)} est. · ${localTime(r.createdAt, false)}`),
+    `Costs are ${COST_LABEL}.`,
     "Ask for one by id to see its phases, handoffs, gate decisions and timing.",
   ].join("\n");
 }
@@ -3051,7 +3169,7 @@ async function runSetup($, opts = {}) {
     name: "Terminal login",
     ok: auth.loggedIn,
     detail: auth.loggedIn ? `logged in (${auth.detail || "ok"})` : auth.detail || "not logged in",
-    fix: "Run in Terminal: claude auth login. Until then, threads run inline inside this chat.",
+    fix: "Run in Terminal: claude auth login. Until then no session thread starts; an inline thread (--inline) runs inside this chat only if you ask for one.",
     critical: true,
   });
   const tmux = await run($, ["tmux", "-V"], 5000);
@@ -3109,6 +3227,7 @@ async function runSetup($, opts = {}) {
       ? `Close the stale ones (ask me, or /threads setup clean)${stale.some((x) => x.why === "its lead chat is gone") ? ", or adopt the orphans so this chat leads them (ask me, or /threads adopt all)" : ""}. Or raise the cap: /threads cap <n>.`
       : "Close a thread (ask me, or /threads close <id>) or raise the cap: /threads cap <n>.",
   });
+  checks.push(await computerUseCheck($, p));
   checks.push({ name: "Default permission mode", ok: true, detail: `${await defaultMode($)} (change with /threads mode <mode>; inline threads use this chat's mode)` });
   const root = String($.plugin.root ?? "");
   const how = /\/plugins\/(cache|marketplaces)\//.test(root)
@@ -3131,6 +3250,33 @@ async function runSetup($, opts = {}) {
   lines.push(passed ? "Session threads are ready." : "Session threads are not ready yet; inline threads (--inline) work now.");
   await logEvent($, p, "setup", { passed, failing: checks.filter((c) => !c.ok).map((c) => c.name) });
   return { passed, checks, text: lines.join("\n") };
+}
+
+// Not critical: without the codex-computer-use mod (or with an older one) threads still work, just without desktop control.
+async function computerUseCheck($, p) {
+  const listed = await run($, ["claude", "plugin", "list", "--json"], 20000);
+  const cu = listed.exitCode === 0 ? computerUsePlugin(listed.stdout) : null;
+  const sock = `${p.home}/.claude/mcp/codex-cu/daemon.sock`;
+  let hasSock = false;
+  try {
+    hasSock = await $.fs.exists(sock);
+  } catch {
+    hasSock = false;
+  }
+  const notes = [];
+  if (!cu) notes.push(listed.exitCode === 0 ? "the codex-computer-use mod is not installed" : `could not list plugins (${clip(oneLine(listed.stderr), 120)})`);
+  else {
+    if (!cu.enabled) notes.push(`codex-computer-use ${cu.version} is installed but disabled`);
+    if (!versionAtLeast(cu.version, CU_MIN_VERSION)) notes.push(`codex-computer-use ${cu.version} is older than ${CU_MIN_VERSION}, which this integration needs`);
+  }
+  if (cu && !hasSock) notes.push(`its daemon socket ${tidyPath(sock, 80, p.home)} is not there (the daemon is not running)`);
+  const ok = notes.length === 0;
+  return {
+    name: "Computer use",
+    ok,
+    detail: ok ? `codex-computer-use ${cu.version} enabled, daemon socket present` : `dependency note: ${notes.join("; ")}. Threads work without it, only without desktop control.`,
+    fix: `Install or update codex-computer-use (${CU_MIN_VERSION} or newer) and enable it, only if threads should drive desktop apps.`,
+  };
 }
 
 function setupSummary(checks) {
@@ -3170,6 +3316,8 @@ async function savePlan($, p, plan) {
 async function createPlan($, input) {
   const v = validatePlan(input);
   if (v.error) return { error: v.error };
+  const readOnly = await registryReadOnly($);
+  if (readOnly) return { error: readOnly };
   const setupNote = await setupOnFirstUse($);
   const made = await createPlanChecked($, input, v);
   if (!setupNote) return made;
@@ -3194,8 +3342,9 @@ async function createPlanChecked($, input, v) {
   let backend = requested;
   if (requested !== "inline") {
     const auth = await authStatus($);
-    backend = auth.loggedIn ? "session" : requested === "session" ? "" : "inline";
-    if (!backend) return { error: `${LOGIN_HINT} Or run the plan inline (backend inline).` };
+    // the same rule as one thread: auto never turns into inline threads on its own
+    backend = auth.loggedIn ? "session" : "";
+    if (!backend) return { error: `${LOGIN_HINT} ${INLINE_OFFER.replace("an inline thread", "inline threads").replace("(/threads new ... --inline) runs it as a background agent", "runs each phase as a background agent")}` };
   }
   if (backend === "session") {
     let claudeJson = "";
@@ -3295,6 +3444,18 @@ async function startPhaseNow($, p, plan, i, opts) {
   return `Phase ${phaseNumber(i)} ${ph.name} started as ${made.id} on ${ph.model}${ph.effort ? `/${ph.effort}` : ""}.`;
 }
 
+// A phase thread ended (exited, crashed, killed, closed) before handing off: the phase and plan are interrupted.
+async function phaseInterrupted($, p, t, reason, opts = {}) {
+  const plan = await loadPlan($, p, t.planId);
+  if (!plan) return;
+  const now = await $.clock.now();
+  const stepped = stepPlan(plan, { type: "interrupted", index: t.phaseIndex, reason, at: now });
+  if (stepped.actions.every((a) => a.type === "ignored")) return;
+  await savePlan($, p, stepped.plan);
+  await logEvent($, p, "phase-interrupted", { planId: plan.id, phase: (t.phaseIndex ?? 0) + 1, thread: t.id, reason });
+  await runPlanActions($, p, stepped.plan, stepped.actions, opts);
+}
+
 // A phase thread finished a turn: did it hand off? Then the gate decides.
 async function phaseFinished($, p, t, opts) {
   const plan = await loadPlan($, p, t.planId);
@@ -3388,17 +3549,21 @@ async function runPlanActions($, p, plan, actions, opts) {
     } else if (a.type === "ask-user") {
       $.ui.toast(`Plan ${plan.title}: phase ${phaseNumber(a.index + 1)} ready · /threads plan next`, { timeoutMs: 10000 });
       out.push(`Phase ${phaseNumber(a.index)} done; run /threads plan next to start phase ${phaseNumber(a.index + 1)}.`);
+    } else if (a.type === "interrupted") {
+      $.ui.toast(`Plan ${plan.title} interrupted at phase ${phaseNumber(a.index)}: ${a.reason}`, { timeoutMs: 10000 });
+      await planNote($, p, plan, `<plan interrupted: ${plan.title} (${plan.id})>\nPhase ${phaseNumber(a.index)} ${ph?.name ?? ""} was ${a.reason}; it is not complete. Tell the user; /threads plan retry ${a.index + 1} starts it again.\n</plan interrupted>`, { quiet: true });
+      out.push(`Plan interrupted at phase ${phaseNumber(a.index)}: ${a.reason}.`);
     } else if (a.type === "blocked") {
       $.ui.toast(`Plan ${plan.title} is blocked at phase ${phaseNumber(a.index)}: ${a.reason}`, { timeoutMs: 10000 });
       await planNote($, p, plan, `<plan blocked: ${plan.title} (${plan.id})>\nPhase ${phaseNumber(a.index)} ${ph?.name ?? ""}: ${a.reason}. Tell the user; /threads plan retry ${a.index + 1} starts it again.\n</plan blocked>`, { quiet: true });
       out.push(`Plan blocked at phase ${phaseNumber(a.index)}: ${a.reason}.`);
     } else if (a.type === "done") {
       const regNow = await loadRegistry($, p);
-      const costs = new Map(regNow.threads.map((x) => [x.id, x.costUsd ?? 0]));
-      const total = plan.phases.reduce((acc, x) => acc + (costs.get(x.threadId) ?? 0), 0);
+      const byIdNow = new Map(regNow.threads.map((x) => [x.id, x]));
+      const total = sumCosts(plan.phases.filter((x) => x.threadId).map((x) => byIdNow.get(x.threadId) ?? {}));
       const lines = [
-        ...plan.phases.map((x, j) => `${phaseNumber(j)} ${x.name} (${x.model}${x.effort ? `/${x.effort}` : ""}, ${money(costs.get(x.threadId) ?? 0)}): ${x.handoffPath || "(no handoff)"}`),
-        `Total est. API-equivalent: ${money(total)}. History: ${p.dir}/plans/${plan.id}.md`,
+        ...plan.phases.map((x, j) => `${phaseNumber(j)} ${x.name} (${x.model}${x.effort ? `/${x.effort}` : ""}, ${costChip(byIdNow.get(x.threadId) ?? {})}): ${x.handoffPath || "(no handoff)"}`),
+        `Total: ${costText(total.usd ?? (total.unpriced ? undefined : 0), total.unpriced)} (${COST_LABEL}). History: ${p.dir}/plans/${plan.id}.md`,
       ];
       await planNote($, p, plan, `<plan done: ${plan.title} (${plan.id})>\nAll ${plan.phases.length} phases finished. Handoffs:\n${lines.join("\n")}\n${plan.keepThreads ? `The phase threads are idle; /threads plan close ${plan.id} closes them.` : "Accepted phase threads were closed; their transcripts stay and /threads list shows how to resume them."}\n</plan done>`, { quiet: true });
       $.ui.toast(plan.keepThreads ? `Plan ${plan.title} done · /threads plan close closes its threads` : `Plan ${plan.title} done`, { timeoutMs: 10000 });
@@ -3637,7 +3802,7 @@ async function waitForThreads($, args, signal) {
   out.push(`Changed: ${changedIds.length ? changedIds.join(", ") : "none"}`);
   for (const t of rows) {
     out.push("");
-    out.push(`${t.id} ${t.title} [${t.status}] model ${t.verifiedModel || t.requestedModel}${t.costUsd ? ` · ${money(t.costUsd)} est. API-equivalent` : ""}`);
+    out.push(`${t.id} ${t.title} [${t.status}] model ${t.verifiedModel || t.requestedModel} · ${costLine(t)}`);
     const answer = await latestAnswer($, p, t);
     const items = (await transcriptLines($, p, t, 5)).map((l) => `  ${clip(l, 300)}`);
     out.push("  recent:", ...(items.length ? items : ["  (no transcript yet)"]));
@@ -3676,7 +3841,7 @@ async function listText($, opts = {}) {
   const archived = view.threads.filter((t) => t.archived);
   const all = opts.includeArchived ? view.threads : view.threads.filter((t) => !t.archived);
   const fmt = (t) => {
-    const model = `${t.verifiedModel ? `${t.requestedModel} → ${t.verifiedModel}` : `${t.requestedModel} (unverified)`}${t.costUsd ? ` · ${money(t.costUsd)} est.` : ""}${t.pinned ? " · pinned" : ""}${t.forkedFrom ? (t.handedOff ? " · handoff" : " · fork") : ""}${t.archived ? " · archived" : ""}${isUnread(t) ? " · new" : ""}`;
+    const model = `${t.verifiedModel ? `${t.requestedModel} → ${t.verifiedModel}` : `${t.requestedModel} (unverified)`} · ${costLine(t, "est.")}${t.pinned ? " · pinned" : ""}${t.forkedFrom ? (t.handedOff ? " · handoff" : " · fork") : ""}${t.archived ? " · archived" : ""}${isUnread(t) ? " · new" : ""}`;
     const tree = t.worktree ? `, worktree ${t.worktree.branch}${t.worktree.removed ? " (removed)" : t.worktree.kept ? " (kept)" : ""}` : "";
     const desk = t.desktop?.length ? `, desktop ${t.desktop.join("+")}` : "";
     const kind = `${t.backend === "inline" ? "inline, chat's mode" : `session, ${t.permissionMode || "default"}`}${tree}${desk}`;
@@ -3684,6 +3849,8 @@ async function listText($, opts = {}) {
     // full reports only for this chat's open threads; closed ones and other chats' get one line
     const full = opts.forModel && t.isMine && t.status !== "closed";
     if (t.lastReport?.text) lines.push(full ? `      report:\n${t.lastReport.text}` : `      report: ${clip(oneLine(t.lastReport.text), 160)}`);
+    if (t.status === "held-message") lines.push(`      held: a message waits for the person's approval${t.held ? ` (${clip(oneLine(t.held), 120)})` : ""}. ${HELD_HELP}`);
+    if (t.status === "stuck") lines.push("      stuck: busy with no new transcript activity for 10 minutes (a heuristic); read its screen before steering it.");
     if (t.lastLine) lines.push(`      last: ${clip(t.lastLine, 160)}`);
     return lines.join("\n");
   };
@@ -3700,8 +3867,10 @@ async function listText($, opts = {}) {
   }
   if (hiddenClosed) out.push(`(${hiddenClosed} closed thread${hiddenClosed === 1 ? "" : "s"} of other chats hidden; ask to include closed to see them.)`);
   if (archived.length && !opts.includeArchived) out.push(`(${archived.length} archived thread${archived.length === 1 ? "" : "s"} hidden; ask to include archived to see them.)`);
-  const total = mine.reduce((a, t) => a + (t.costUsd ?? 0), 0);
-  if (total) out.push(`This chat's threads: ${money(total)} est. API-equivalent (list prices, not billing).`);
+  if (mine.length) {
+    const total = sumCosts(mine);
+    out.push(`This chat's threads: ${costText(total.usd ?? (total.unpriced ? undefined : 0), total.unpriced)} ${COST_LABEL}.`);
+  }
   return clip(out.join("\n"), opts.forModel ? 16000 : 20000);
 }
 
