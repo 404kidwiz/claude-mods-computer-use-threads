@@ -337,6 +337,8 @@ const YES_OPTION = /^\s*[❯>›]?\s*1\.\s+Yes\b/m;
 const HELD = /Held message from another session/;
 // the codex-computer-use mod's approval pane: "Allow Codex to use <App>?" (older versions: "Allow Codex computer use to use <App>?")
 const CU_ASK = /Allow Codex (?:computer use )?to use (.+?)\?/;
+// The CLI's working line above the prompt: a spinner glyph, a verb with an ellipsis ("⠼ Composing…  2m 16s").
+const BUSY_LINE = /^[^\S\n]*[\u2800-\u28FF✻✽✢✶✳*·][^\S\n]+[A-Z][\w-]*…/m;
 const BYPASS_WARNING = /WARNING: Claude Code running in Bypass Permissions mode|you accept all responsibility for actions taken while running in Bypass Permissions mode/i;
 
 export function readScreen(text) {
@@ -346,6 +348,7 @@ export function readScreen(text) {
     .split("\n")
     .map((l) => l.replace(/^[\s│┃]+/, (m) => m.replace(/[│┃]/g, " ")).replace(/[\s│┃]+$/, ""));
   const tail = lines.slice(-30).join("\n");
+  const isBusy = BUSY_LINE.test(tail);
   const needsLogin = LOGIN.test(lines.join("\n"));
   const needsTrust = TRUST.test(tail);
   const needsYou = !needsTrust && /Do you want to|Would you like to proceed/.test(tail) && YES_OPTION.test(tail);
@@ -380,14 +383,14 @@ export function readScreen(text) {
   // the one-time bypass warning (should not appear: threads get skipDangerousModePermissionPrompt)
   const bypassWarning = BYPASS_WARNING.test(lines.join("\n"));
   if (bypassWarning) {
-    return { needsLogin, needsTrust, needsYou: true, prompt: "the bypass permissions warning (Yes, I accept / No, exit)", isCursorOnYes: false, heldMessage: false, heldPreview: "", bypassWarning };
+    return { needsLogin, needsTrust, needsYou: true, prompt: "the bypass permissions warning (Yes, I accept / No, exit)", isCursorOnYes: false, heldMessage: false, heldPreview: "", bypassWarning, isBusy };
   }
   // a thread waiting on Codex computer use's per-app approval (keys: a this session, l always, d deny)
   const cu = CU_ASK.exec(tail);
   if (cu && !heldMessage) {
-    return { needsLogin, needsTrust, needsYou: true, prompt: `Codex computer use wants to use ${cu[1]} (approve allows it for that thread's session)`, isCursorOnYes: false, heldMessage: false, heldPreview: "", bypassWarning: false, cuApproval: cu[1] };
+    return { needsLogin, needsTrust, needsYou: true, prompt: `Codex computer use wants to use ${cu[1]} (approve allows it for that thread's session)`, isCursorOnYes: false, heldMessage: false, heldPreview: "", bypassWarning: false, cuApproval: cu[1], isBusy };
   }
-  return { needsLogin, needsTrust, needsYou: needsYou && !heldMessage, prompt, isCursorOnYes, heldMessage, heldPreview, bypassWarning: false };
+  return { needsLogin, needsTrust, needsYou: needsYou && !heldMessage, prompt, isCursorOnYes, heldMessage, heldPreview, bypassWarning: false, isBusy };
 }
 
 // Last N non-empty screen lines, trailing spaces trimmed.
@@ -408,6 +411,8 @@ export function screenLines(text, n) {
 
 // tmux: { isLive, isDead }, session: the ~/.claude/sessions json or null, pidAlive, screen: readScreen()
 // lastAt: the newest transcript row's time (0 when unknown); busy with nothing new for STUCK_MS is stuck
+// The sessions file can say "idle" while the screen still shows the working spinner (seen live with a
+// slow first reply), so a spinner on screen means working.
 export function statusOf({ previous, tmux, session, pidAlive, screen, now, createdAt, lastAt = 0 }) {
   if (previous === "closed") return "closed";
   if (!tmux?.isLive || tmux.isDead) return "exited";
@@ -418,7 +423,10 @@ export function statusOf({ previous, tmux, session, pidAlive, screen, now, creat
   if (session && pidAlive !== false) {
     if (session.status === "busy") return lastAt && now - lastAt >= STUCK_MS ? "stuck" : "working";
     if (session.status === "waiting") return "needs-you";
-    if (session.status === "idle") return "idle";
+    if (session.status === "idle") {
+      if (screen?.isBusy) return "working";
+      return "idle";
+    }
   }
   if (now - (createdAt ?? now) < 120000) return "starting";
   return session ? "idle" : "starting";

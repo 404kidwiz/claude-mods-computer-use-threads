@@ -498,6 +498,10 @@ describe("threads: pure helpers", () => {
     expect(statusOf(base)).toBe("working");
     expect(statusOf({ ...base, session: { status: "idle" } })).toBe("idle");
     expect(statusOf({ ...base, session: { status: "waiting" } })).toBe("needs-you");
+    // live test 2026-10-12: the sessions file said idle while the screen still showed the working spinner
+    expect(statusOf({ ...base, session: { status: "idle" }, screen: readScreen("⠼ Composing…  2m 16s\n❯ ") })).toBe("working");
+    expect(statusOf({ ...base, session: { status: "idle" }, screen: readScreen("✻ Thinking… (esc to interrupt)") })).toBe("working");
+    expect(statusOf({ ...base, session: { status: "idle" }, screen: readScreen("Done. 2 files.\n❯ ") })).toBe("idle");
     expect(statusOf({ ...base, screen: readScreen(PERMISSION_SCREEN) })).toBe("needs-you");
     expect(statusOf({ ...base, screen: readScreen("Login expired · Please run /login") })).toBe("needs-login");
     expect(statusOf({ ...base, screen: readScreen("Not logged in · Run /login") })).toBe("needs-login");
